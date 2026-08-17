@@ -76,7 +76,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "**Time to First Token (TTFT)** measures the critical latency from when a request is received until the first token is generated. Lower values indicate better user experience.\n\n• **P50**: 50% of requests complete faster\n• **P95**: 95% of requests complete faster (SLA threshold)\n• **P99**: 99% of requests complete faster (tail latency)",
+      "description": "**Time to First Token (TTFT)** measures the critical latency from when a request is received until the first token is generated. Lower values indicate better user experience.\n\n\u2022 **P50**: 50% of requests complete faster\n\u2022 **P95**: 95% of requests complete faster (SLA threshold)\n\u2022 **P99**: 99% of requests complete faster (tail latency)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -164,7 +164,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.50, rate(vllm:time_to_first_token_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m]))",
+          "expr": "histogram_quantile(0.50, rate(sglang:time_to_first_token_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m]))",
           "legendFormat": "P50 TTFT",
           "refId": "A"
         },
@@ -173,7 +173,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, rate(vllm:time_to_first_token_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m]))",
+          "expr": "histogram_quantile(0.95, rate(sglang:time_to_first_token_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m]))",
           "legendFormat": "P95 TTFT",
           "refId": "B"
         },
@@ -182,7 +182,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.99, rate(vllm:time_to_first_token_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m]))",
+          "expr": "histogram_quantile(0.99, rate(sglang:time_to_first_token_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m]))",
           "legendFormat": "P99 TTFT",
           "refId": "C"
         }
@@ -195,7 +195,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "**Inter-Token Latency** measures the time between generating successive tokens during decode. Lower latencies mean faster text generation.\n\n• **P50**: Median token generation speed\n• **P95**: 95th percentile generation speed",
+      "description": "**Inter-Token Latency** measures the time between generating successive tokens during decode. Lower latencies mean faster text generation.\n\n\u2022 **P50**: Median token generation speed\n\u2022 **P95**: 95th percentile generation speed",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -273,7 +273,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.50, sum by(le) (rate(vllm:inter_token_latency_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(sglang:inter_token_latency_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m])))",
           "legendFormat": "P50 Inter-Token",
           "refId": "A"
         },
@@ -282,7 +282,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum by(le) (rate(vllm:inter_token_latency_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(sglang:inter_token_latency_seconds_bucket{model_name=~\"$model\", namespace=~\"$namespace\"}[5m])))",
           "legendFormat": "P95 Inter-Token",
           "refId": "B"
         }
@@ -295,7 +295,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "**KV Cache Hit Rate** measures prefix cache effectiveness. Higher hit rates (>60%) indicate better cache efficiency and reduced computation.\n\n• **Red (0-30%)**: Poor cache efficiency\n• **Yellow (30-60%)**: Moderate efficiency\n• **Green (60%+)**: Good cache efficiency",
+      "description": "**KV Cache Hit Rate** measures prefix cache effectiveness. Higher hit rates (>60%) indicate better cache efficiency and reduced computation.\n\n\u2022 **Red (0-30%)**: Poor cache efficiency\n\u2022 **Yellow (30-60%)**: Moderate efficiency\n\u2022 **Green (60%+)**: Good cache efficiency",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -352,7 +352,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(vllm:prefix_cache_hits_total{model_name=~\"$model\", namespace=~\"$namespace\"}) / sum(vllm:prefix_cache_queries_total{model_name=~\"$model\", namespace=~\"$namespace\"})",
+          "expr": "avg(sglang:cache_hit_rate{model_name=~\"$model\", namespace=~\"$namespace\"})",
           "legendFormat": "Cache Hit Rate",
           "refId": "A"
         }
@@ -429,7 +429,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "vllm:prefix_cache_hits_total{model_name=~\"$model\", namespace=~\"$namespace\"} / vllm:prefix_cache_queries_total{model_name=~\"$model\", namespace=~\"$namespace\"}",
+          "expr": "avg by(pod) (sglang:cache_hit_rate{model_name=~\"$model\", namespace=~\"$namespace\"})",
           "legendFormat": "Pod {{pod}}",
           "refId": "A"
         }
@@ -499,7 +499,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "avg(vllm:kv_cache_usage_perc{namespace=~\"$namespace\"}) * 100",
+          "expr": "avg(sum by(pod) (sglang:kv_used_tokens{namespace=~\"$namespace\"}) / sum by(pod) (sglang:max_total_num_tokens{namespace=~\"$namespace\"}) * 100)",
           "legendFormat": "Cache Usage %",
           "refId": "A"
         }
@@ -577,7 +577,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "vllm:kv_cache_usage_perc{namespace=~\"$namespace\"} * 100",
+          "expr": "(sum by(pod) (sglang:kv_used_tokens{namespace=~\"$namespace\"}) / sum by(pod) (sglang:max_total_num_tokens{namespace=~\"$namespace\"}) * 100)",
           "legendFormat": "Pod {{pod}}",
           "refId": "A"
         }
@@ -668,7 +668,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "rate(vllm:request_success_total{model_name=~\"$model\", namespace=~\"$namespace\"}[5m])",
+          "expr": "rate(sglang:num_requests_total{model_name=~\"$model\", namespace=~\"$namespace\"}[5m])",
           "legendFormat": "Success Rate",
           "refId": "A"
         },
@@ -677,7 +677,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "rate(vllm:e2e_request_latency_seconds_count{model_name=~\"$model\", namespace=~\"$namespace\"}[5m])",
+          "expr": "rate(sglang:e2e_request_latency_seconds_count{model_name=~\"$model\", namespace=~\"$namespace\"}[5m])",
           "legendFormat": "Total Rate",
           "refId": "B"
         }
@@ -788,7 +788,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "vllm:num_requests_running{model_name=~\"$model\", namespace=~\"$namespace\"}",
+          "expr": "sglang:num_running_reqs{model_name=~\"$model\", namespace=~\"$namespace\"}",
           "legendFormat": "Requests Running",
           "refId": "A"
         },
@@ -797,7 +797,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "vllm:num_requests_waiting{model_name=~\"$model\", namespace=~\"$namespace\"}",
+          "expr": "sglang:num_queue_reqs{model_name=~\"$model\", namespace=~\"$namespace\"}",
           "legendFormat": "Requests Waiting",
           "refId": "B"
         }
@@ -1032,12 +1032,12 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(vllm:num_requests_running, model_name)",
+        "definition": "label_values(sglang:num_running_reqs, model_name)",
         "includeAll": true,
         "label": "Model",
         "name": "model",
         "options": [],
-        "query": "label_values(vllm:num_requests_running, model_name)",
+        "query": "label_values(sglang:num_running_reqs, model_name)",
         "refresh": 1,
         "regex": "",
         "sort": 1,
@@ -1054,12 +1054,12 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(vllm:num_requests_running, namespace)",
+        "definition": "label_values(sglang:num_running_reqs, namespace)",
         "includeAll": true,
         "label": "Namespace",
         "name": "namespace",
         "options": [],
-        "query": "label_values(vllm:num_requests_running, namespace)",
+        "query": "label_values(sglang:num_running_reqs, namespace)",
         "refresh": 1,
         "regex": "",
         "sort": 1,

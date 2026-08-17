@@ -1,0 +1,318 @@
+# Decode StatefulSet — 4 节点分布式 Decode (llm-d 适配版)
+#
+# 基于 /opt/backup/k8s-sglang-pd/statefulset-mode 的生产验证配置
+# 已适配 llm-d: 保留 llm-d 标签体系
+#
+# Master IP 发现: 通过 K8s API 获取 pod-0 的 status.podIP (内置在主容器, 避免 GPU 驱动二次初始化)
+# 节点标签: metax-sglang-pd-decode=true
+# 端口:     modelserver=8200, nixl=5600, dist-init=5000
+# 并行度:   TP=32, DP=32, EP=32, PP=1
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: decode
+  namespace: metax-ai-pd
+  labels:
+    llm-d.ai/role: decode
+    llm-d.ai/guide: pd-disaggregation
+    llm-d.ai/accelerator-vendor: metax
+    llm-d.ai/engine-type: sglang
+spec:
+  serviceName: decode-headless
+  replicas: 4
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      llm-d.ai/role: decode
+  template:
+    metadata:
+      labels:
+        llm-d.ai/role: decode
+    spec:
+      hostNetwork: true
+      hostIPC: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: mx-sglang-pd-prefill-sa
+
+      # ── 节点亲和性 (兼容 metax-sglang-pd-decode 标签 + pd-role 标签) ──
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: metax-sglang-pd-decode
+                    operator: In
+                    values: ["true"]
+              - matchExpressions:
+                  - key: pd-role
+                    operator: In
+                    values:
+                      - "group-0-decode-1"
+                      - "group-0-decode-1-r0"
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  llm-d.ai/role: decode
+              topologyKey: kubernetes.io/hostname
+
+      # ── 节点 IP → hostname 映射 (c10d 反向解析) ──
+      hostAliases:
+        - ip: "10.0.0.166"
+          hostnames: ["mxgpu-1-166"]
+        - ip: "10.0.0.167"
+          hostnames: ["mxgpu-1-167"]
+        - ip: "10.0.0.168"
+          hostnames: ["mxgpu-1-168"]
+        - ip: "10.0.0.169"
+          hostnames: ["mxgpu-1-169"]
+
+      securityContext: {}
+
+      # ── llm-d routing-proxy sidecar (KV connector 管理 + 请求转发) ──
+      initContainers:
+        - name: routing-proxy
+          image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.9.0
+          imagePullPolicy: Always
+          args:
+            - --port=8000
+            - --vllm-port=8200
+            - --kv-connector=sglang
+            - --zap-log-level=1
+            - --secure-proxy=false
+          ports:
+            - containerPort: 8000
+              name: sidecar
+              protocol: TCP
+          resources:
+            requests: { memory: "8Gi", cpu: "4" }
+            limits:   { memory: "16Gi", cpu: "8" }
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+
+      containers:
+        - name: modelserver
+          image: harbor.mycompany.com/metax/sglang:glmpd
+          imagePullPolicy: Always
+          workingDir: /opt/llm-launch-GLM5
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+
+              # ── Master IP 发现 (内置在主容器, 避免 GPU 驱动二次初始化) ──
+              NODE_RANK_ID="${POD_NAME##*-}"
+              NNODES="4"
+              K8S_NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+              CACERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+              K8S_API="https://${KUBERNETES_SERVICE_HOST}"
+
+              if [ "${NODE_RANK_ID}" = "0" ]; then
+                MASTER_IP="${POD_IP}"
+                echo "[init] I am master, MASTER_IP=${MASTER_IP}"
+              else
+                PREFIX="${POD_NAME%-*}"
+                POD0_NAME="${PREFIX}-0"
+                for i in $(seq 1 30); do
+                  MASTER_IP=$(curl -sk --connect-timeout 5 --cacert "${CACERT}" \
+                    -H "Authorization: Bearer ${TOKEN}" \
+                    "${K8S_API}/api/v1/namespaces/${K8S_NS}/pods/${POD0_NAME}" 2>/dev/null \
+                    | python3 -c "import sys,json; print(json.load(sys.stdin)['status']['podIP'])" 2>/dev/null)
+                  [ -n "$MASTER_IP" ] && break
+                  echo "[init] Waiting for ${POD0_NAME} podIP... ($i/30)"
+                  sleep 2
+                done
+                [ -n "$MASTER_IP" ] || { echo "ERROR: Cannot get master IP"; exit 1; }
+                echo "[init] MASTER_IP=${MASTER_IP}"
+              fi
+
+              if ! grep -q "${POD_NAME}" /etc/hosts 2>/dev/null; then
+                echo "${POD_IP} ${POD_NAME}" >> /etc/hosts
+              fi
+
+              # ── MACA/CUDA driver tuning ──
+              export CUDA_PATH=/opt/maca/tools/cu-bridge
+              export MACA_PATH=/opt/maca
+              export CUDA_QUEUE_SCHEDULE_POLICY=1
+              export MACA_QUEUE_SCHEDULE_POLICY=1
+              export CUDA_SMALL_PAGESIZE_ENABLE=1
+              export MACA_SMALL_PAGESIZE_ENABLE=1
+
+              # ── Triton tuning ──
+              export TRITON_ENABLE_ELEMENTWISE_PK_FMA_OPT=True
+              export TRITON_DISABLE_CUDA_OPT_MMA_PREFETCH=1
+              export TRITON_DISABLE_MACA_OPT_MMA_PREFETCH=1
+              export TRITON_ENABLE_CUDA_CHAIN_DOT_OPT=1
+              export TRITON_ENABLE_MACA_CHAIN_DOT_OPT=1
+              export TRITON_ENABLE_CUDA_COMPILER_INT8_OPT=1
+              export TRITON_ENABLE_MACA_COMPILER_INT8_OPT=1
+              export TRITON_ENABLE_CUDA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP=1
+              export TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP=1
+              export TORCH_CUDA_ARCH_LIST="8.0 8.6+PTX"
+              export TORCH_MACA_ARCH_LIST="8.0 8.6+PTX"
+              export PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM=1
+
+              # ── Network ──
+              export GLOO_SOCKET_IFNAME=manage0
+              export NCCL_SOCKET_IFNAME=manage0
+              export MCCL_SOCKET_IFNAME=manage0
+              export NCCL_IB_HCA="=mlx5_0,mlx5_1"
+              export MCCL_IB_HCA="=mlx5_0,mlx5_1"
+
+              # ── SHMEM ──
+              export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=manage0
+              export MXSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=manage0
+              export NVSHMEM_DISABLE_CUDA_VMM=1
+              export MXSHMEM_DISABLE_MACA_VMM=1
+              export NVSHMEM_SYMMETRIC_SIZE=3g
+              export MXSHMEM_SYMMETRIC_SIZE=3g
+              export NVSHMEM_HCA_LIST=mlx5_1
+              export MXSHMEM_HCA_LIST=mlx5_1
+
+              # ── SGLang tuning ──
+              export SGLANG_DISAGGREGATION_QUEUE_SIZE=8
+              export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=24
+              export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=1
+              export USE_INDEX_CACHE=1
+              export MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE=256
+              export PIPE_OPT_ON_SHARE=true
+              export USE_SINGLE_STREAM_DISPATCH_OVERLAP=True
+              export SGLANG_ENABLE_JIT_DEEPGEMM=1
+              export SGLANG_DEEPEP_BF16_DISPATCH=1
+              export SGLANG_STATIC_EPLB=True
+
+              # ── Decode-specific ──
+              export EXPERT_RECORD=True
+              export FUSED_RMSNORM_QUANT=True
+              export NV_SGLANG_GLOO_OPT=1
+              export MX_SGLANG_GLOO_OPT=1
+              export MX_ENABLE_NSA_INDEXER_GEMM_BF16=True
+              export MX_ENABLE_FLASH_MLA_METADATA_CACHE=True
+
+              # ── Python ──
+              export PYTHONFAULTHANDLER=1
+              export PYTHONUNBUFFERED=1
+
+              # ── DNS 快速失败 ──
+              export RES_OPTIONS="timeout:1 attempts:1"
+
+              # ── RDMA memlock ──
+              ulimit -l unlimited
+
+              # ── 加载可调参数 (通过 env var 覆盖 config.sh) ──
+              [ -n "${SGLANG_CONTEXT_LENGTH:-}" ]       && export context_length_specific="$SGLANG_CONTEXT_LENGTH"
+              [ -n "${SGLANG_MEM_FRACTION_STATIC:-}" ]  && export mem_fraction_static_specific="$SGLANG_MEM_FRACTION_STATIC"
+              [ -n "${SGLANG_CHUNKED_PREFILL_SIZE:-}" ] && export chunked_prefill_size_default="$SGLANG_CHUNKED_PREFILL_SIZE"
+              [ -n "${SGLANG_TP_SIZE:-}" ]  && export decode_tp_size_specific="$SGLANG_TP_SIZE"
+              [ -n "${SGLANG_PP_SIZE:-}" ]  && export decode_pp_size_specific="$SGLANG_PP_SIZE"
+              [ -n "${SGLANG_DP_SIZE:-}" ]  && export decode_dp_size_specific="$SGLANG_DP_SIZE"
+              [ -n "${SGLANG_EP_SIZE:-}" ]  && export decode_ep_size_specific="$SGLANG_EP_SIZE"
+              [ -n "${SGLANG_MAX_RUNNING_REQUESTS:-}" ] && export decode_max_running_requests_specific="$SGLANG_MAX_RUNNING_REQUESTS"
+              [ "${SGLANG_DISABLE_CUDA_GRAPH:-}" = "1" ] && export enable_cuda_graph_specific="false"
+              [ "${SGLANG_DISABLE_SPECULATIVE:-}" = "1" ] && export enable_speculative_specific="false"
+              [ "${SGLANG_DISABLE_EPLB:-}" = "1" ]   && export enable_eplb_specific="false"
+              [ -n "${SGLANG_QUANTIZATION:-}" ]        && export quantization_specific="$SGLANG_QUANTIZATION"
+
+              # decode 端口改为 8200
+              sed -i 's/\(readonly \)\?decode_server_port=.*/readonly decode_server_port="8200"/' sglang/config.sh
+
+              echo "[RUN] NODE_IP=${POD_IP} MASTER_IP=${MASTER_IP} NNODES=${NNODES} RANK=${NODE_RANK_ID}"
+              exec bash sglang/decode.sh glm-5.sh "${MASTER_IP}" "${NNODES}" "${NODE_RANK_ID}"
+          env:
+            # ── Pod 元数据 (用于 K8s API 发现) ──
+            - name: POD_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            # ── 可调参数 (可通过 kubectl set env 修改) ──
+            - name: PD_ROLE
+              value: "decode"
+            - name: SGLANG_CONTEXT_LENGTH
+              value: "200000"
+            - name: SGLANG_MEM_FRACTION_STATIC
+              value: "0.80"
+            - name: SGLANG_CHUNKED_PREFILL_SIZE
+              value: "14336"
+            - name: SGLANG_TP_SIZE
+              value: "32"
+            - name: SGLANG_PP_SIZE
+              value: "1"
+            - name: SGLANG_DP_SIZE
+              value: "32"
+            - name: SGLANG_EP_SIZE
+              value: "32"
+            - name: SGLANG_MAX_RUNNING_REQUESTS
+              value: "512"
+            - name: SGLANG_DISABLE_CUDA_GRAPH
+              value: "0"
+            - name: SGLANG_DISABLE_SPECULATIVE
+              value: "1"
+            - name: SGLANG_DISABLE_EPLB
+              value: "1"
+            - name: SGLANG_QUANTIZATION
+              value: "compressed-tensors"
+          securityContext:
+            privileged: true
+            runAsGroup: 44
+          ports:
+            - name: modelserver
+              containerPort: 8200
+              protocol: TCP
+            - name: nixl
+              containerPort: 5600
+              protocol: TCP
+            - name: dist-init
+              containerPort: 5000
+              protocol: TCP
+          resources:
+            limits:   { memory: "1000Gi", cpu: "160" }
+            requests: { memory: "32Gi", cpu: "8" }
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: model-data
+              mountPath: /workspace/data
+            - name: mxdriver
+              mountPath: /opt/mxdriver
+              readOnly: true
+            - name: mxcd
+              mountPath: /dev/mxcd
+          startupProbe:
+            httpGet:
+              path: /health
+              port: modelserver
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 180
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: modelserver
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: modelserver
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+      volumes:
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 100Gi }
+        - name: model-data
+          hostPath: { path: /data, type: DirectoryOrCreate }
+        - name: mxdriver
+          hostPath: { path: /opt/mxdriver, type: DirectoryOrCreate }
+        - name: mxcd
+          hostPath: { path: /dev/mxcd, type: CharDevice }

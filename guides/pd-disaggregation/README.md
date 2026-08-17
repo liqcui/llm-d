@@ -44,6 +44,7 @@ This guide includes configuration for the following accelerators:
 | AMD GPU             | `modelserver/amd/vllm/`    | AMD GPU, community contributed                           |
 | Intel XPU           | `modelserver/xpu/vllm/`    | Intel Data Center GPU Max 1550+, community contributed   |
 | Intel XPU + RDMA    | `modelserver/xpu/vllm-rdma/` | Intel XPU with RDMA via UCX (`ib,rc,ze_copy`), requires RDMA DRA driver |
+| 沐曦 (MetaX) GPU    | `modelserver/gpu/sglang/metax/` | SGLang on 沐曦 C500/C600, MACA SDK, IB/RoCE RDMA |
 
 > [!NOTE]
 > Some hardware variants use reduced configurations (fewer replicas, smaller models) to enable CI testing for compatibility and regression checks. These configurations are maintained by their respective hardware vendors and are not guaranteed as production-ready examples. Users deploying on non-default hardware should review and adjust the configurations for their environment.
@@ -181,6 +182,27 @@ SGLang-specific notes:
 > * SGLang P/D is **validated each release** on NVIDIA GPU but is not yet part of the nightly E2E CI that covers the vLLM path (the badges above).
 > * The SGLang P/D overlays are **NVIDIA GPU only** today; the AMD overlay (`modelserver/amd/vllm/`) provides vLLM P/D only.
 > * On the NIXL transfer backend, SGLang has no explicit prefill-side free-notification (as vLLM does) and no prefill-side reclaim timeout, so a request cancelled before the decode initiates the transfer can strand KV cache on the prefill until the pod restarts. See the [SGLang operations doc](../../docs/architecture/advanced/disaggregation/operations-sglang.md).
+
+</details>
+
+<details>
+<summary><h4>Deploying with 沐曦 (MetaX) GPU</h4></summary>
+
+沐曦 C500/C600 GPU 使用 SGLang + MACA SDK，支持两种部署方式。
+详见独立文档：
+
+- **[LeaderWorkerSet 部署指南](./README.metax-lws.md)**（推荐 — llm-d 标准多节点模式）
+- **[StatefulSet 部署指南](./README.metax-sts.md)**（备选 — K8s 原生资源）
+
+```bash
+# LWS 方式（推荐）
+kubectl apply -n metax-ai-pd -k ${REPO_ROOT}/guides/${GUIDE_NAME}/modelserver/gpu/sglang/metax/lws/
+
+# StatefulSet 方式（备选）
+kubectl apply -n metax-ai-pd -k ${REPO_ROOT}/guides/${GUIDE_NAME}/modelserver/gpu/sglang/metax/multi-node/
+```
+
+</details>
 
 ### 3. Enable Monitoring (optional)
 

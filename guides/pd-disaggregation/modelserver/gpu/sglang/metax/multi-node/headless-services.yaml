@@ -1,0 +1,60 @@
+# Headless Services — 用于 StatefulSet Pod DNS 发现
+#
+# Prefill headless: 端口 8000 (modelserver), 5600 (nixl), 5000 (dist-init)
+# Decode headless:  端口 8000 (sidecar EPP入口), 8200 (modelserver), 5600 (nixl), 5000 (dist-init)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prefill-headless
+  namespace: metax-ai-pd
+  labels:
+    llm-d.ai/role: prefill
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  clusterIP: None
+  selector:
+    llm-d.ai/role: prefill
+  ports:
+    - name: modelserver
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+    - name: nixl
+      port: 5600
+      targetPort: 5600
+      protocol: TCP
+    - name: dist-init
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: decode-headless
+  namespace: metax-ai-pd
+  labels:
+    llm-d.ai/role: decode
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  clusterIP: None
+  selector:
+    llm-d.ai/role: decode
+  ports:
+    - name: sidecar
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+    - name: modelserver
+      port: 8200
+      targetPort: 8200
+      protocol: TCP
+    - name: nixl
+      port: 5600
+      targetPort: 5600
+      protocol: TCP
+    - name: dist-init
+      port: 5000
+      targetPort: 5000
+      protocol: TCP

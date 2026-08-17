@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 沐曦 (MetaX) GPU 多节点 PD 分离 — StatefulSet 模式 (llm-d 适配版)
+#
+# 基于 /opt/backup/k8s-sglang-pd/statefulset-mode 的生产验证配置
+# 已适配 llm-d: 标签体系、headless service、routing-proxy sidecar
+#
+# 部署前需给节点打标签:
+#   kubectl label node <prefill-node> metax-sglang-pd-prefill=true --overwrite
+#   kubectl label node <decode-node>  metax-sglang-pd-decode=true --overwrite
+#
+# 拓扑:
+#   Prefill StatefulSet × 4, 每 pod 8 GPU, TP=8 PP=4 DP=1, port=8000
+#   Decode  StatefulSet × 4, 每 pod 8 GPU, TP=32 DP=32 EP=32 PP=1, port=8200
+#   跨节点 KV Cache 传输: NIXL over IB/RoCE (mlx5_0)
+
+namespace: metax-ai-pd
+
+resources:
+  - rbac.yaml
+  - prefill-statefulset.yaml
+  - decode-statefulset.yaml
+  - headless-services.yaml
+
+labels:
+  - pairs:
+      llm-d.ai/model: glm-5.1-w8a8
+      llm-d.ai/guide: pd-disaggregation
+      llm-d.ai/accelerator-variant: gpu
+      llm-d.ai/accelerator-vendor: metax
+      llm-d.ai/engine-type: sglang
+    includeSelectors: true
+    includeTemplates: true

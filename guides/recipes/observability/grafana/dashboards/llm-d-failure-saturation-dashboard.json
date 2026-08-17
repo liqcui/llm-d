@@ -545,7 +545,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(vllm:time_to_first_token_seconds_bucket{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(sglang:time_to_first_token_seconds_bucket{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m])))",
           "instant": false,
           "legendFormat": "{{model_name}}",
           "range": true,
@@ -643,7 +643,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(sglang:inter_token_latency_seconds_bucket{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m])))",
           "instant": false,
           "legendFormat": "{{model_name}}",
           "range": true,
@@ -731,7 +731,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "avg_over_time(up{job=\"gaie-optimized-baseline-epp\",namespace=~\"$namespace\"}[5m])",
+          "expr": "avg_over_time(up{job=\"pd-disaggregation-epp\",namespace=~\"$namespace\"}[5m])",
           "instant": false,
           "legendFormat": "Scheduler",
           "range": true,
@@ -1085,7 +1085,7 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(vllm:generation_tokens_total,model_name)",
+        "definition": "label_values(sglang:generation_tokens_total,model_name)",
         "includeAll": true,
         "label": "model_name",
         "multi": true,
@@ -1093,7 +1093,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(vllm:generation_tokens_total,model_name)",
+          "query": "label_values(sglang:generation_tokens_total,model_name)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,

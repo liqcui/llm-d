@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - decode.yaml
+  - prefill.yaml
+  - router.yaml
+  - serviceAccount.yaml
+
+labels:
+  - pairs:
+      llm-d.ai/model: glm-5.2-w8a8
+      llm-d.ai/guide: pd-disaggregation
+      llm-d.ai/accelerator-variant: gpu
+      llm-d.ai/accelerator-vendor: metax
+      llm-d.ai/engine-type: sglang
+    includeSelectors: true
+    includeTemplates: true
+    # LWS 是 CRD，需通过 fields 指定标签注入路径（参照 llm-d wide-ep-lws 规范）
+    fields:
+      - version: v1
+        kind: ServiceAccount
+        path: metadata/labels
+        create: true
+      - group: leaderworkerset.x-k8s.io
+        version: v1
+        kind: LeaderWorkerSet
+        path: metadata/labels
+        create: true
+      - group: leaderworkerset.x-k8s.io
+        version: v1
+        kind: LeaderWorkerSet
+        path: spec/leaderWorkerTemplate/workerTemplate/metadata/labels
+        create: true

@@ -137,7 +137,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(vllm:time_to_first_token_seconds_sum{pod=~\".*prefill.*\"}[5m])) / sum(rate(vllm:time_to_first_token_seconds_count{pod=~\".*prefill.*\"}[5m])) * 1000",
+          "expr": "sum(rate(sglang:time_to_first_token_seconds_sum{pod=~\".*prefill.*\"}[5m])) / sum(rate(vllm:time_to_first_token_seconds_count{pod=~\".*prefill.*\"}[5m])) * 1000",
           "refId": "A",
           "legendFormat": "Avg vLLM TTFT"
         }
@@ -210,7 +210,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "(sum(rate(vllm:time_to_first_token_seconds_sum{pod=~\".*prefill.*\"}[5m])) / sum(rate(vllm:time_to_first_token_seconds_count{pod=~\".*prefill.*\"}[5m])) + sum(rate(vllm:time_to_first_token_seconds_sum{pod=~\".*decode.*\"}[5m])) / sum(rate(vllm:time_to_first_token_seconds_count{pod=~\".*decode.*\"}[5m]))) * 1000",
+          "expr": "(sum(rate(sglang:time_to_first_token_seconds_sum{pod=~\".*prefill.*\"}[5m])) / sum(rate(vllm:time_to_first_token_seconds_count{pod=~\".*prefill.*\"}[5m])) + sum(rate(sglang:time_to_first_token_seconds_sum{pod=~\".*decode.*\"}[5m])) / sum(rate(vllm:time_to_first_token_seconds_count{pod=~\".*decode.*\"}[5m]))) * 1000",
           "refId": "A",
           "legendFormat": "True End-to-End TTFT"
         }
@@ -283,7 +283,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(vllm:time_to_first_token_seconds_sum{pod=~\".*decode.*\"}[5m])) / sum(rate(vllm:time_to_first_token_seconds_count{pod=~\".*decode.*\"}[5m])) * 1000",
+          "expr": "sum(rate(sglang:time_to_first_token_seconds_sum{pod=~\".*decode.*\"}[5m])) / sum(rate(vllm:time_to_first_token_seconds_count{pod=~\".*decode.*\"}[5m])) * 1000",
           "refId": "A",
           "legendFormat": "Avg vLLM TTFT"
         }
@@ -440,7 +440,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
           "refId": "A",
           "legendFormat": "p50"
         },
@@ -449,7 +449,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sglang:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
           "refId": "B",
           "legendFormat": "p95"
         },
@@ -458,7 +458,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
           "refId": "C",
           "legendFormat": "p99"
         }
@@ -549,7 +549,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
           "refId": "A",
           "legendFormat": "p50"
         },
@@ -558,7 +558,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sglang:e2e_request_latency_seconds_bucket{}[$__rate_interval])))",
           "refId": "B",
           "legendFormat": "p95"
         }
@@ -840,7 +840,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{pod=~\".*decode.*\"}[5m]))) * 1000",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket{pod=~\".*decode.*\"}[5m]))) * 1000",
           "refId": "A",
           "legendFormat": "p50"
         },
@@ -849,7 +849,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{pod=~\".*decode.*\"}[5m]))) * 1000",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket{pod=~\".*decode.*\"}[5m]))) * 1000",
           "refId": "B",
           "legendFormat": "p95"
         },
@@ -858,7 +858,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{pod=~\".*decode.*\"}[5m]))) * 1000",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket{pod=~\".*decode.*\"}[5m]))) * 1000",
           "refId": "C",
           "legendFormat": "p99"
         }
@@ -1521,7 +1521,19 @@
     "tracing"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {},
+        "includeAll": false,
+        "label": "datasource",
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
   },
   "time": {
     "from": "now-1h",

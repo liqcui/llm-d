@@ -1,0 +1,204 @@
+# Prefill LeaderWorkerSet — DeepSeek-V4-Flash PD 分离 (llm-d 规范, 参照 GLM metax/lws/)
+#
+# 拓扑: LWS replicas=4, size=1 → 4 个独立 Prefill 实例, 每实例 1 节点 8 卡
+#   并行度: 由官方脚本计算 (prefill_pp_size_specific=8 → TP=1 PP=8)
+#   启动:   镜像内官方 llm-launch 脚本
+#           bash sglang/prefill.sh deepseek-v4-flash.sh <master-ip> 1 0
+#   端口:   8000 (HTTP, llm-d EPP 入口); PD bootstrap = 7977 (RC config.sh 显式)
+#   EPP:    InferencePool pd-disaggregation 按 llm-d.ai/guide=pd-disaggregation 发现
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: prefill-dsv4
+  labels:
+    llm-d.ai/role: prefill
+spec:
+  replicas: 4
+  leaderWorkerTemplate:
+    size: 1
+    restartPolicy: RecreateGroupOnPodRestart
+    workerTemplate:
+      metadata:
+        labels:
+          llm-d.ai/role: prefill
+          llm-d.ai/model: deepseek-v4-flash-w8a8
+          llm-d.ai/guide: pd-disaggregation
+      spec:
+        hostNetwork: true
+        hostIPC: true
+        hostPID: true
+        dnsPolicy: ClusterFirstWithHostNet
+        serviceAccountName: mx-sglang-pd-lws
+        # 8-14/8-15 故障报告建议: 宽限期 120s 降低新旧代交接窗口的
+        # MCCL/Gloo 连接污染概率 (RecreateGroupOnPodRestart 整组重建)
+        terminationGracePeriodSeconds: 120
+
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: metax-sglang-pd-prefill-dsv4
+                      operator: In
+                      values: ["true"]
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    llm-d.ai/role: prefill
+                topologyKey: kubernetes.io/hostname
+
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+          supplementalGroups: [44]
+
+        containers:
+          - name: modelserver
+            image: harbor.mycompany.com/metax/sglang:0.5.12-dsv4
+            imagePullPolicy: Always
+            workingDir: /workspace
+            command:
+              - bash
+              - -c
+              - |
+                set -e
+
+                # ── 沐曦平台环境 (与 GLM 部署对齐) ──
+                export CUDA_PATH=/opt/maca/tools/cu-bridge
+                export MACA_PATH=/opt/maca
+                export CUDA_QUEUE_SCHEDULE_POLICY=1
+                export MACA_QUEUE_SCHEDULE_POLICY=1
+                export CUDA_SMALL_PAGESIZE_ENABLE=1
+                export MACA_SMALL_PAGESIZE_ENABLE=1
+                export MACA_DIRECT_DISPATCH=1
+                export TRITON_ENABLE_ELEMENTWISE_PK_FMA_OPT=True
+                export TRITON_DISABLE_CUDA_OPT_MMA_PREFETCH=1
+                export TRITON_DISABLE_MACA_OPT_MMA_PREFETCH=1
+                export TRITON_ENABLE_CUDA_CHAIN_DOT_OPT=1
+                export TRITON_ENABLE_MACA_CHAIN_DOT_OPT=1
+                export TRITON_ENABLE_CUDA_COMPILER_INT8_OPT=1
+                export TRITON_ENABLE_MACA_COMPILER_INT8_OPT=1
+                export TRITON_ENABLE_CUDA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP=1
+                export TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP=1
+                export TORCH_CUDA_ARCH_LIST="8.0 8.6+PTX"
+                export TORCH_MACA_ARCH_LIST="8.0 8.6+PTX"
+                export PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM=1
+                export GLOO_SOCKET_IFNAME=manage0
+                export NCCL_SOCKET_IFNAME=manage0
+                export MCCL_SOCKET_IFNAME=manage0
+                export NCCL_IB_HCA="=mlx5_0,mlx5_1"
+                export MCCL_IB_HCA="=mlx5_0,mlx5_1"
+                export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=manage0
+                export MXSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=manage0
+                export NVSHMEM_DISABLE_CUDA_VMM=1
+                export MXSHMEM_DISABLE_MACA_VMM=1
+                export NVSHMEM_SYMMETRIC_SIZE=3g
+                export MXSHMEM_SYMMETRIC_SIZE=3g
+                export NVSHMEM_HCA_LIST=mlx5_1
+                export MXSHMEM_HCA_LIST=mlx5_1
+                export SGLANG_DISAGGREGATION_QUEUE_SIZE=8
+                export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=24
+                export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=1
+                export USE_INDEX_CACHE=1
+                export SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD=0
+                export PYTHONFAULTHANDLER=1
+                export PYTHONUNBUFFERED=1
+                export RES_OPTIONS="timeout:1 attempts:1"
+                ulimit -l unlimited
+                sysctl -w net.ipv4.ip_local_reserved_ports="8000,8998,5000" 2>/dev/null || true
+
+                # C500 JIT workaround (文档 §8.1) 与端口/bootstrap/host/metrics 修复
+                # 由 pd-adapter.sh §3.5 幂等应用 (镜像未内置则补上, 已内置则跳过),
+                # 此处仅保留运行时缓存清理
+                rm -rf /root/.cache/tvm-ffi
+
+                cd /workspace/llm-launch
+                # ── 日志落盘 ──
+                mkdir -p /var/log/sglang-dsv4
+                echo "[LWS] $(date '+%F %T') group start rank=${LWS_WORKER_INDEX:-0}/${LWS_GROUP_SIZE:-1}" >> /var/log/sglang-dsv4/${PD_ROLE}-rank${LWS_WORKER_INDEX:-0}.log
+                # 拓扑解析/调参覆盖/启动摘要/拉起引擎 全部由 ConfigMap 挂载的
+                # pd-adapter.sh 完成 (模型 spec 默认 deepseek-v4-flash, 可经 PD_MODEL_SPEC env 覆盖)
+                bash /workspace/llm-d/pd-adapter.sh 2>&1 | tee -a /var/log/sglang-dsv4/${PD_ROLE}-rank${LWS_WORKER_INDEX:-0}.log
+                exit "${PIPESTATUS[0]}"
+            env:
+              - name: POD_IP
+                valueFrom:
+                  fieldRef: { fieldPath: status.podIP }
+              - name: PD_ROLE
+                value: "prefill"
+              # fork 默认 EnvBool(True) → disagg prefill idle 时池核算
+              # 微差即 raise 杀死 scheduler; 恢复上游默认 False (仅告警)
+              - name: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
+                value: "false"
+            securityContext:
+              privileged: true
+            ports:
+              - name: http
+                containerPort: 8000
+                protocol: TCP
+              - name: bootstrap
+                containerPort: 8998
+                protocol: TCP
+              - name: nixl
+                containerPort: 5600
+                protocol: TCP
+              - name: dist-init
+                containerPort: 5000
+                protocol: TCP
+            resources:
+              limits:   { memory: "1000Gi", cpu: "160", "metax-tech.com/gpu": "8" }
+              requests: { memory: "32Gi", cpu: "8", "metax-tech.com/gpu": "8" }
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: model-data
+                mountPath: /workspace/data
+              - name: mxdriver
+                mountPath: /opt/mxdriver
+                readOnly: true
+              - name: mxcd
+                mountPath: /dev/mxcd
+              - name: sglang-log
+                mountPath: /var/log/sglang-dsv4
+              - name: pd-adapter
+                mountPath: /workspace/llm-d
+                readOnly: true
+            startupProbe:
+              httpGet:
+                path: /health
+                port: http
+              initialDelaySeconds: 60
+              periodSeconds: 30
+              timeoutSeconds: 5
+              failureThreshold: 180
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: http
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 5
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: http
+              periodSeconds: 5
+              timeoutSeconds: 10
+              failureThreshold: 3
+
+        volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 100Gi }
+          - name: model-data
+            hostPath: { path: /data, type: DirectoryOrCreate }
+          - name: mxdriver
+            hostPath: { path: /opt/mxdriver, type: DirectoryOrCreate }
+          - name: mxcd
+            hostPath: { path: /dev/mxcd, type: CharDevice }
+          - name: sglang-log
+            hostPath: { path: /var/log/sglang-dsv4, type: DirectoryOrCreate }
+          - name: pd-adapter
+            configMap:
+              name: pd-smart-adapter
+              defaultMode: 0555

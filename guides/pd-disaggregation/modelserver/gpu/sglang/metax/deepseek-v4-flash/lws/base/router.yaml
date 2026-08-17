@@ -1,0 +1,103 @@
+# SGLang Router Deployment — DeepSeek-V4-Flash PD 分离 (sglang 默认网关, 与 llm-d EPP 并行)
+#
+# 用途: 与 llm-d EPP 网关 (pd-disaggregation-epp:8081) 做性能对比的第二个入口。
+#   集群外直连: http://10.0.0.232:8001/v1/chat/completions
+#   Metrics:    http://10.0.0.232:29000/metrics
+#
+# 文档 §8.4: Router 不需要 GPU, 但 RC 镜像 import SGLang 时会做 GPU device probe:
+#   1. sed 关闭 common.py:391 的 torch.cuda.get_device_name(0) import 期 probe
+#   2. export SGLANG_ENABLE_SPECIFIC_DEVICE_OPT=false
+#   3. 直接启动 python3 -m sglang_router.launch_router (不走 vendor minilb wrapper,
+#      后者 source utils.sh 会在 CPU-only 节点触发 sdk_arch unbound 崩溃)
+#   4. RC 镜像 PATH 不含 /opt/conda/bin, 必须显式使用 conda python
+#
+# --prefill 第二参数 8998 = prefill PD bootstrap 端口 (sglang 默认, llm-d 规范对齐)
+# hostNetwork: 与 EPP 同节点 (mxgpu-1-232), 集群外可直接压测对比。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek-v4-router
+  labels:
+    app: deepseek-v4-router
+    llm-d.ai/model: deepseek-v4-flash-w8a8
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseek-v4-router
+  template:
+    metadata:
+      labels:
+        app: deepseek-v4-router
+        llm-d.ai/model: deepseek-v4-flash-w8a8
+    spec:
+      serviceAccountName: mx-sglang-pd-lws
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: metax-sglang-pd-router-dsv4
+                    operator: In
+                    values: ["true"]
+      containers:
+        - name: router
+          image: harbor.mycompany.com/metax/sglang:0.5.12-dsv4
+          imagePullPolicy: Always
+          workingDir: /workspace
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              export SGLANG_ENABLE_SPECIFIC_DEVICE_OPT=false
+              # 文档 §8.4 workaround: RC 镜像 common.py:391 在 import 时执行
+              # torch.cuda.get_device_name(0), CPU-only Router 会 RuntimeError。
+              sed -i 's/"MetaX C600" in torch\.cuda\.get_device_name(0)/False/' \
+                /opt/conda/lib/python3.10/site-packages/sglang/srt/utils/common.py
+              # worker 地址用节点 IP 直连 (hostNetwork 下 P/D 即监听在节点 IP 上,
+              # 等价于固定 NodePort): 不依赖集群 DNS (232 节点 nodelocal DNS 对
+              # hostNetwork pod 解析异常)。节点由 nodeAffinity 标签固定, Pod 漂移
+              # 不越出角色节点集合, IP:端口 始终命中某个实例; 未就绪实例由
+              # launch_router health check 自动剔除。
+              echo "[ROUTER] launch_router: 4x prefill(:8000, bootstrap 8998) + 4x decode(:8200)"
+              exec /opt/conda/bin/python3 -m sglang_router.launch_router \
+                --pd-disaggregation \
+                --prefill http://10.0.0.147:8000 8998 \
+                --prefill http://10.0.0.154:8000 8998 \
+                --prefill http://10.0.0.165:8000 8998 \
+                --prefill http://10.0.0.166:8000 8998 \
+                --decode http://10.0.0.152:8200 \
+                --decode http://10.0.0.167:8200 \
+                --decode http://10.0.0.168:8200 \
+                --decode http://10.0.0.169:8200 \
+                --host 0.0.0.0 --port 8001 \
+                --prometheus-host 0.0.0.0 --prometheus-port 29000 \
+                --request-timeout-secs 18000 --health-check-timeout-secs 90
+          ports:
+            - name: http
+              containerPort: 8001
+              protocol: TCP
+            - name: metrics
+              containerPort: 29000
+              protocol: TCP
+          resources:
+            requests: { memory: "8Gi", cpu: "4" }
+            limits:   { memory: "16Gi", cpu: "8" }
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+      restartPolicy: Always

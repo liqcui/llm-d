@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 沐曦 (MetaX) SGLang PD 分离 — LeaderWorkerSet 模式 (llm-d 规范)
+#
+# 目录结构 (参照 wide-ep-lws):
+#   base/                  — LWS 资源 (prefill + decode + SA)
+#   kustomization.yaml     — 部署入口
+#
+# 部署前:
+#   1. kubectl apply -f https://github.com/kubernetes-sigs/lws/releases/latest/download/manifests.yaml
+#   2. kubectl label node <prefill-node> metax-sglang-pd-prefill=true --overwrite
+#   3. kubectl label node <decode-node>  metax-sglang-pd-decode=true --overwrite
+#
+# 拓扑:
+#   Prefill LWS: replicas=1, size=4 → 4 pods (TP=8 PP=4, port=8000, 每 pod 8 GPU)
+#   Decode LWS:  replicas=1, size=4 → 4 pods (TP=32 DP=32 EP=32, port=8200, 每 pod 8 GPU)
+
+namespace: metax-ai-pd
+
+resources:
+  - base

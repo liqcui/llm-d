@@ -154,7 +154,11 @@
       "id": 201,
       "options": {
         "legend": {
-          "calcs": ["max", "mean", "lastNotNull"],
+          "calcs": [
+            "max",
+            "mean",
+            "lastNotNull"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -171,7 +175,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "avg by(pod) (vllm:kv_cache_usage_perc{namespace=~\"$namespace\",model_name=~\"$model_name\"})",
+          "expr": "avg by(pod) (sum by(pod) (sglang:kv_used_tokens{namespace=~\"$namespace\",model_name=~\"$model_name\"}) / sum by(pod) (sglang:max_total_num_tokens{namespace=~\"$namespace\",model_name=~\"$model_name\"}) * 100)",
           "instant": false,
           "legendFormat": "{{pod}}-{{model_name}}",
           "range": true,
@@ -268,7 +272,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by(pod) (vllm:num_requests_waiting{namespace=~\"$namespace\",model_name=~\"$model_name\"})",
+          "expr": "sum by(pod) (sglang:num_queue_reqs{namespace=~\"$namespace\",model_name=~\"$model_name\"})",
           "instant": false,
           "legendFormat": "{{pod}}-{{model_name}}",
           "range": true,
@@ -366,7 +370,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by(model_name, pod) (rate(vllm:prompt_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]) + rate(vllm:generation_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]))",
+          "expr": "sum by(model_name, pod) (rate(vllm:prompt_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]) + rate(sglang:generation_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]))",
           "instant": false,
           "legendFormat": "{{model_name}}-{{pod}}",
           "range": true,
@@ -464,7 +468,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by(model_name, pod) (rate(vllm:generation_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]))",
+          "expr": "sum by(model_name, pod) (rate(sglang:generation_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]))",
           "instant": false,
           "legendFormat": "{{model_name}}-{{pod}}",
           "range": true,
@@ -561,7 +565,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "avg by(pod) (vllm:num_requests_running{namespace=~\"$namespace\",model_name=~\"$model_name\"})",
+          "expr": "avg by(pod) (sglang:num_running_reqs{namespace=~\"$namespace\",model_name=~\"$model_name\"})",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -770,7 +774,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by(pod) (rate(vllm:prompt_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]) + rate(vllm:generation_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]))",
+          "expr": "sum by(pod) (rate(vllm:prompt_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]) + rate(sglang:generation_tokens_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]))",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -870,7 +874,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "1 - avg by(pod) (rate(vllm:iteration_tokens_total_count{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]) > 0)",
+          "expr": "1 - avg by(pod) (sglang:fwd_occupancy{namespace=~\"$namespace\",model_name=~\"$model_name\"})",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -1056,7 +1060,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(vllm:prefix_cache_hits_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m])) / sum(rate(vllm:prefix_cache_queries_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]))",
+          "expr": "avg(sglang:cache_hit_rate{namespace=~\"$namespace\",model_name=~\"$model_name\"})",
           "instant": false,
           "legendFormat": "Hit Rate",
           "range": true,
@@ -1156,7 +1160,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by(pod) (rate(vllm:prefix_cache_hits_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m])) / sum by(pod) (rate(vllm:prefix_cache_queries_total{namespace=~\"$namespace\",model_name=~\"$model_name\"}[5m]))",
+          "expr": "avg by(pod) (sglang:cache_hit_rate{namespace=~\"$namespace\",model_name=~\"$model_name\"})",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -1266,7 +1270,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "avg by(pod) (vllm:num_requests_running{pod=~\".*prefill.*\",namespace=~\"$namespace\",model_name=~\"$model_name\"})",
+          "expr": "avg by(pod) (sglang:num_running_reqs{pod=~\".*prefill.*\",namespace=~\"$namespace\",model_name=~\"$model_name\"})",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -1365,7 +1369,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "avg by(pod) (vllm:kv_cache_usage_perc{pod=~\".*decode.*\",namespace=~\"$namespace\",model_name=~\"$model_name\"})",
+          "expr": "avg by(pod) (sum by(pod) (sglang:kv_used_tokens{pod=~\".*decode.*\",namespace=~\"$namespace\",model_name=~\"$model_name\"}) / sum by(pod) (sglang:max_total_num_tokens{pod=~\".*decode.*\",namespace=~\"$namespace\",model_name=~\"$model_name\"}) * 100)",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -1462,7 +1466,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by(pod) (vllm:num_requests_waiting{pod=~\".*prefill.*\",namespace=~\"$namespace\",model_name=~\"$model_name\"})",
+          "expr": "sum by(pod) (sglang:num_queue_reqs{pod=~\".*prefill.*\",namespace=~\"$namespace\",model_name=~\"$model_name\"})",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -1522,7 +1526,7 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(vllm:generation_tokens_total,model_name)",
+        "definition": "label_values(sglang:generation_tokens_total,model_name)",
         "includeAll": true,
         "label": "model_name",
         "multi": true,
@@ -1530,7 +1534,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(vllm:generation_tokens_total,model_name)",
+          "query": "label_values(sglang:generation_tokens_total,model_name)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,

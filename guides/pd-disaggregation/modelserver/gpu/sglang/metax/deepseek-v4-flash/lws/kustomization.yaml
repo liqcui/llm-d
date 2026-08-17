@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 沐曦 (MetaX) SGLang PD 分离 — DeepSeek-V4-Flash — 4 Prefill + 4 Decode (llm-d 规范, 参照 GLM metax/lws/)
+#
+# ⚠️ 独立部署: 与 GLM (metax/lws/) 完全分离, 互不影响
+#
+# 目录结构:
+#   base/                  — LWS (prefill-dsv4 + decode-dsv4) + headless Services + SA
+#   kustomization.yaml     — 部署入口
+#
+# 部署前:
+#   1. LWS CRD 已装
+#   2. 模型: 所有候选节点宿主机 /data/DeepSeek-V4-Flash-FlexSMQ-AWQ-W8A8 必须存在 (hostPath)
+#   3. 节点标签 (hostNetwork 端口冲突, 各角色节点互斥):
+#        prefill ×4: kubectl label node <node> metax-sglang-pd-prefill-dsv4=true --overwrite
+#        decode  ×4: kubectl label node <node> metax-sglang-pd-decode-dsv4=true --overwrite
+#   4. RDMA: 节点 mlx5_0/mlx5_1 应为 IB ACTIVE (ibdev2netdev 检查, 文档 §10)
+#   5. InferencePool pd-disaggregation (Helm 管理) selector 匹配
+#      llm-d.ai/guide=pd-disaggregation + worker-index=0, targetPort 8000
+#
+# 拓扑 (llm-d EPP 接入, 4+4 多实例):
+#   Prefill LWS: replicas=4 size=1 → 4 pods / 4 节点 / 32 卡 (TP=1 PP=8, HTTP :8000, bootstrap :7977)
+#   Decode LWS:  replicas=4 size=1 → 4 pods / 4 节点 / 32 卡 (TP=8 DP=8 EP=8, modelserver :8200)
+#                每 decode pod 带 routing-proxy sidecar (:8000, kv-connector=sglang, EPP 入口)
+#   访问链路:   Client → EPP (pd-disaggregation-epp:80) → routing-proxy:8000 → prefill:8000 / decode:8200
+
+namespace: metax-ai-pd
+
+resources:
+  - base

@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 沐曦 (MetaX) GPU overlay for SGLang PD disaggregation
+# 适配国产沐曦 C500/C600 GPU + MACA SDK
+#
+# 支持的模型: GLM-5.1, DeepSeek-R1, Qwen3.5-397B
+# 适用硬件: 沐曦 C500 (metax-c588) / C600 (metax-c600)
+# 每节点: 8 GPU, 每个 GPU 2 dies = 16 tiles
+
+# 直接引用底层 PD recipe 资源，继承 prefill/decode deployment 模板
+resources:
+  - ../../../../../recipes/modelserver/base/single-host/pd/sglang
+
+namePrefix: pd-disaggregation-metax-sglang-
+
+# 仅引入 routing-sidecar 组件（model server 镜像由下方的 images 字段覆盖）
+components:
+  - ../../../../../recipes/modelserver/components/images/routing-sidecar
+
+labels:
+  - pairs:
+      llm-d.ai/model: glm-5.1-w8a8
+      llm-d.ai/guide: pd-disaggregation
+      llm-d.ai/accelerator-variant: gpu
+      llm-d.ai/accelerator-vendor: metax
+      llm-d.ai/engine-type: sglang
+    includeSelectors: true
+    includeTemplates: true
+
+# 用沐曦镜像覆盖 recipe 中的占位符
+# routing-sidecar 镜像保持使用 llm-d 官方镜像
+images:
+  - name: REPLACE_MODEL_SERVER_IMAGE
+    newName: harbor.mycompany.com/metax/sglang
+    newTag: glmpd
+  - name: REPLACE_ROUTING_SIDECAR_IMAGE
+    newName: ghcr.io/llm-d/llm-d-router-disagg-sidecar
+    newTag: v0.9.1
+
+# 沐曦 patch：资源、env、挂载、args 等
+patches:
+  - path: patch-decode.yaml
+  - path: patch-prefill.yaml

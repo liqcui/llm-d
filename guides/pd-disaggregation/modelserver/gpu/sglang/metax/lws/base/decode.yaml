@@ -1,0 +1,237 @@
+# Decode LeaderWorkerSet — 4 节点分布式 Decode (llm-d 规范)
+#
+# LWS 拓扑: replicas=1, size=4 → 4 pods
+# LWS 自动注入: LWS_WORKER_INDEX (node-rank), LWS_LEADER_ADDRESS (master), LWS_GROUP_SIZE (nnodes)
+# initContainer: routing-proxy (llm-d sidecar, restartPolicy=Always)
+# llm-d Router 通过 llm-d.ai/role=decode 标签发现并通过 routing-proxy:8000 路由请求
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: decode
+  labels:
+    llm-d.ai/role: decode
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 4
+    restartPolicy: RecreateGroupOnPodRestart   # 任一 Pod 容器重启 → 整组重建(与线上一致)
+    workerTemplate:
+      metadata:
+        labels:
+          llm-d.ai/role: decode
+      spec:
+        hostNetwork: true
+        hostIPC: true
+        hostPID: true
+        dnsPolicy: ClusterFirstWithHostNet
+        serviceAccountName: mx-sglang-pd-lws
+
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: metax-sglang-pd-decode
+                      operator: In
+                      values: ["true"]
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    llm-d.ai/role: decode
+                topologyKey: kubernetes.io/hostname
+
+        securityContext: {}
+
+        # ── llm-d routing-proxy sidecar (EPP 请求入口) ──
+        initContainers:
+          - name: routing-proxy
+            image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.9.0
+            imagePullPolicy: Always
+            args:
+              - --port=8000
+              - --vllm-port=8200
+              - --kv-connector=sglang
+              - --zap-log-level=1
+              - --secure-proxy=false
+            ports:
+              - containerPort: 8000
+                name: sidecar
+                protocol: TCP
+            resources:
+              requests: { memory: "8Gi", cpu: "4" }
+              limits:   { memory: "16Gi", cpu: "8" }
+            restartPolicy: Always
+            securityContext:
+              allowPrivilegeEscalation: false
+              runAsNonRoot: true
+
+        containers:
+          - name: modelserver
+            image: harbor.mycompany.com/metax/sglang:glmpd
+            imagePullPolicy: Always
+            workingDir: /opt/llm-launch-GLM5
+            command:
+              - bash
+              - -c
+              - |
+                set -e
+                NODE_RANK_ID="${LWS_WORKER_INDEX:-0}"
+                NNODES="${LWS_GROUP_SIZE:-4}"
+                LEADER_HOST="${LWS_LEADER_ADDRESS%:*}"
+                MASTER_IP=$(getent hosts "${LEADER_HOST}" 2>/dev/null | awk '{print $1}' | head -1)
+                [ -z "$MASTER_IP" ] && MASTER_IP="${POD_IP}"
+                echo "[LWS] RANK=${NODE_RANK_ID}/${NNODES} MASTER=${LEADER_HOST}(${MASTER_IP})"
+
+                if ! grep -q "${HOSTNAME}" /etc/hosts 2>/dev/null; then
+                  echo "${POD_IP} ${HOSTNAME}" >> /etc/hosts
+                fi
+
+                export CUDA_PATH=/opt/maca/tools/cu-bridge
+                export MACA_PATH=/opt/maca
+                export CUDA_QUEUE_SCHEDULE_POLICY=1
+                export MACA_QUEUE_SCHEDULE_POLICY=1
+                export CUDA_SMALL_PAGESIZE_ENABLE=1
+                export MACA_SMALL_PAGESIZE_ENABLE=1
+                export TRITON_ENABLE_ELEMENTWISE_PK_FMA_OPT=True
+                export TRITON_DISABLE_CUDA_OPT_MMA_PREFETCH=1
+                export TRITON_DISABLE_MACA_OPT_MMA_PREFETCH=1
+                export TRITON_ENABLE_CUDA_CHAIN_DOT_OPT=1
+                export TRITON_ENABLE_MACA_CHAIN_DOT_OPT=1
+                export TRITON_ENABLE_CUDA_COMPILER_INT8_OPT=1
+                export TRITON_ENABLE_MACA_COMPILER_INT8_OPT=1
+                export TRITON_ENABLE_CUDA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP=1
+                export TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP=1
+                export TORCH_CUDA_ARCH_LIST="8.0 8.6+PTX"
+                export TORCH_MACA_ARCH_LIST="8.0 8.6+PTX"
+                export PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM=1
+                export GLOO_SOCKET_IFNAME=manage0
+                export NCCL_SOCKET_IFNAME=manage0
+                export MCCL_SOCKET_IFNAME=manage0
+                export NCCL_IB_HCA="=mlx5_0,mlx5_1"
+                export MCCL_IB_HCA="=mlx5_0,mlx5_1"
+                export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=manage0
+                export MXSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=manage0
+                export NVSHMEM_DISABLE_CUDA_VMM=1
+                export MXSHMEM_DISABLE_MACA_VMM=1
+                export NVSHMEM_SYMMETRIC_SIZE=3g
+                export MXSHMEM_SYMMETRIC_SIZE=3g
+                export NVSHMEM_HCA_LIST=mlx5_1
+                export MXSHMEM_HCA_LIST=mlx5_1
+                export SGLANG_DISAGGREGATION_QUEUE_SIZE=8
+                export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=24
+                export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=1
+                export USE_INDEX_CACHE=1
+                export MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE=256
+                export PIPE_OPT_ON_SHARE=true
+                export USE_SINGLE_STREAM_DISPATCH_OVERLAP=True
+                export SGLANG_ENABLE_JIT_DEEPGEMM=1
+                export SGLANG_DEEPEP_BF16_DISPATCH=1
+                export SGLANG_STATIC_EPLB=True
+                export EXPERT_RECORD=True
+                export FUSED_RMSNORM_QUANT=True
+                export NV_SGLANG_GLOO_OPT=1
+                export MX_SGLANG_GLOO_OPT=1
+                export MX_ENABLE_NSA_INDEXER_GEMM_BF16=True
+                export MX_ENABLE_FLASH_MLA_METADATA_CACHE=True
+                export PYTHONFAULTHANDLER=1
+                export PYTHONUNBUFFERED=1
+                export RES_OPTIONS="timeout:1 attempts:1"
+                ulimit -l unlimited
+
+                # ── 可调参数 (参照 start_pd.sh _override_model_var) ──
+                # 这些通过 sed 直接修改模型配置文件，在脚本 source 之前生效
+                [ -n "${SGLANG_CONTEXT_LENGTH:-}" ] && export context_length_specific="$SGLANG_CONTEXT_LENGTH"
+                [ -n "${SGLANG_DECODE_MAX_RUNNING_REQUESTS_BASE:-}" ] && \
+                    sed -i "s/^readonly decode_max_running_requests_specific=.*/readonly decode_max_running_requests_specific=${SGLANG_DECODE_MAX_RUNNING_REQUESTS_BASE}/" sglang/models/glm-5.sh
+                [ -n "${SGLANG_MTP:-}" ] && \
+                    sed -i "s/^readonly decode_mtp_specific=.*/readonly decode_mtp_specific=${SGLANG_MTP}/" sglang/models/glm-5.sh
+                # 模型切换 (镜像 glm-5.sh 默认指向 5.1): 设置 SGLANG_MODEL_PATH 即换模型
+                [ -n "${SGLANG_MODEL_PATH:-}" ] && \
+                    sed -i "s|^readonly model_path_specific=.*|readonly model_path_specific=\"${SGLANG_MODEL_PATH}\"|" sglang/models/glm-5.sh
+
+                sed -i 's/\(readonly \)\?decode_server_port=.*/readonly decode_server_port="8200"/' sglang/config.sh
+                sed -i 's|--host="$local_ip"|--host=0.0.0.0|g' sglang/config.sh
+                echo "[RUN] MASTER_IP=${MASTER_IP} NNODES=${NNODES} RANK=${NODE_RANK_ID}"
+
+                # ── 日志落盘: SGLang 输出 tee 到宿主机 /var/log/sglang,Pod 重建后仍可回溯崩溃现场 ──
+                mkdir -p /var/log/sglang
+                echo "[LWS] $(date '+%F %T') group start rank=${NODE_RANK_ID}/${NNODES}" >> /var/log/sglang/decode-rank${NODE_RANK_ID}.log
+                bash sglang/decode.sh glm-5.sh "${MASTER_IP}" "${NNODES}" "${NODE_RANK_ID}" 2>&1 | tee -a /var/log/sglang/decode-rank${NODE_RANK_ID}.log
+                exit "${PIPESTATUS[0]}"
+            env:
+              - name: POD_IP
+                valueFrom:
+                  fieldRef: { fieldPath: status.podIP }
+              - name: PD_ROLE
+                value: "decode"
+              - name: SGLANG_CONTEXT_LENGTH
+                value: "200000"
+              - name: SGLANG_DECODE_MAX_RUNNING_REQUESTS_BASE
+                value: "16"    # 最终值 = 16 × dp_size(32) = 512
+              - name: SGLANG_MTP
+                value: "4"     # MTP draft tokens
+              - name: SGLANG_MODEL_PATH
+                value: "/workspace/data/GLM-5.2-W8A8"  # GLM-5.2 升级: 5.1 → 5.2
+            securityContext:
+              privileged: true
+              runAsGroup: 44
+            ports:
+              - name: modelserver
+                containerPort: 8200
+                protocol: TCP
+              - name: nixl
+                containerPort: 5600
+                protocol: TCP
+              - name: dist-init
+                containerPort: 5000
+                protocol: TCP
+            resources:
+              limits:   { memory: "1000Gi", cpu: "160" }
+              requests: { memory: "32Gi", cpu: "8" }
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: model-data
+                mountPath: /workspace/data
+              - name: mxdriver
+                mountPath: /opt/mxdriver
+                readOnly: true
+              - name: mxcd
+                mountPath: /dev/mxcd
+              - name: sglang-log
+                mountPath: /var/log/sglang
+            startupProbe:
+              httpGet:
+                path: /health
+                port: modelserver
+              initialDelaySeconds: 90
+              periodSeconds: 30
+              timeoutSeconds: 5
+              failureThreshold: 180
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: modelserver
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: modelserver
+              periodSeconds: 5
+              timeoutSeconds: 2
+              failureThreshold: 3
+
+        volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 100Gi }
+          - name: model-data
+            hostPath: { path: /data, type: DirectoryOrCreate }
+          - name: mxdriver
+            hostPath: { path: /opt/mxdriver, type: DirectoryOrCreate }
+          - name: mxcd
+            hostPath: { path: /dev/mxcd, type: CharDevice }
+          - name: sglang-log
+            hostPath: { path: /var/log/sglang, type: DirectoryOrCreate }

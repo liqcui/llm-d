@@ -5,6 +5,8 @@ router:
       protocol: TCP
       targetPort: 8081
 
+  hostNetwork: true
+
   epp:
     pluginsConfigFile: "pd-config.yaml"
     pluginsCustomConfig:
@@ -44,3 +46,7 @@ router:
   modelServers:
     matchLabels:
       llm-d.ai/guide: "pd-disaggregation"
+      # 沐曦多节点 PD: 仅将 P/D 主节点 (worker-index=0) 加入 InferencePool。
+      # 只有主节点运行 SGLang disaggregation bootstrap server (8998)，
+      # worker 节点收到请求会生成指向不存在的 bootstrap 地址，导致 decode handshake 失败。
+      leaderworkerset.sigs.k8s.io/worker-index: "0"

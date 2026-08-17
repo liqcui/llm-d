@@ -1,0 +1,324 @@
+# Decode 实例配置 - 沐曦 (MetaX) GPU
+#
+# 沐曦 Decode 策略:
+#   - DP=8, TP=8, EP=8, PP=1 (适合 8 GPU 单节点 MoE)
+#   - 启用 CUDA Graph 减少 decode kernel launch 开销
+#   - 启用 DeepEP 进行 Expert-Parallel 通信
+#   - 使用 flashinfer attention backend
+#   - 端口 8200 (与 sidecar 8000 区分)
+#
+# 扩展为多节点:
+#   设置 replicas=1, 在 args 中添加:
+#     --dist-init-addr=<master_ip>:5000
+#     --nnodes=4
+#     --node-rank=<rank>
+#   并将 --tp-size 调整为 32, --dp-size 调整为 32, --ep-size 调整为 32
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decode
+spec:
+  replicas: 1
+  template:
+    spec:
+      # 沐曦 RDMA 需要 hostNetwork
+      hostNetwork: true
+      hostIPC: true
+      # hostNetwork 模式下强制使用集群 DNS
+      dnsPolicy: ClusterFirstWithHostNet
+
+      # 节点选择器 - 沐曦 GPU 节点
+      nodeSelector:
+        accelerators.metax-tech.com/gpu: "true"
+
+      # 容忍沐曦 GPU 节点污点
+      tolerations:
+        - key: metax-tech.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.alibabacloud.com/bmcp
+          operator: Exists
+          effect: NoSchedule
+
+      initContainers:
+        # llm-d routing-proxy sidecar (复用 NVIDIA SGLang 的 sidecar 配置)
+        # 负责: 请求转发到 Prefill / KV 连接管理
+        - name: routing-proxy
+          args:
+            - --port=8000
+            - --vllm-port=8200
+            - --kv-connector=sglang
+            - --zap-log-level=1
+            - --secure-proxy=false
+          image: REPLACE_ROUTING_SIDECAR_IMAGE
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: sidecar
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              memory: 16Gi
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+
+      containers:
+        - name: modelserver
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            # ── 模型与基础配置 ──
+            - "--model-path=/workspace/data/GLM-5.1-W8A8"
+            - "--port=8200"
+            - "--host=0.0.0.0"
+
+            # ── PD 分离配置 ──
+            - "--disaggregation-mode=decode"
+            - "--disaggregation-transfer-backend=nixl"
+
+            # ── 并行度 (单节点 8 GPU: TP=8 DP=8 EP=8 PP=1) ──
+            - "--tensor-parallel-size=8"
+            - "--dp-size=8"
+            - "--ep-size=8"
+            - "--pp-size=1"
+            - "--enable-dp-lm-head"
+            - "--moe-dense-tp-size=1"
+
+            # ── Decode 专用配置 ──
+            - "--chunked-prefill-size=14336"
+            - "--max-running-requests=32"
+            - "--mem-fraction-static=0.83"
+
+            # ── CUDA Graph (减少 kernel launch overhead) ──
+            - "--cuda-graph-bs"
+            - "1,2,3,4,5,6,7,8,10,12,14,16,18,20,22,24,26,28,30,32"
+            - "--cuda-graph-max-bs=32"
+
+            # ── DeepEP (Expert-Parallel 通信) ──
+            - "--moe-a2a-backend=deepep"
+            - "--deepep-mode=low_latency"
+            - "--moe-runner-backend=deep_gemm"
+
+            # ── MACA 专用 flags ──
+            - "--attention-backend=flashinfer"
+            - "--dtype=auto"
+            - "--trust-remote-code"
+            - "--disable-shared-experts-fusion"
+
+            # ── 负载均衡 ──
+            - "--load-balance-method=total_requests"
+            - "--prefill-round-robin-balance"
+
+            # ── RDMA IB 设备 ──
+            - "--disaggregation-ib-device=mlx5_0"
+
+          env:
+            # ── HuggingFace Token ──
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+
+            # ── 沐曦 MACA SDK ──
+            - name: CUDA_PATH
+              value: /opt/maca
+            - name: MACA_PATH
+              value: /opt/maca
+            - name: CUDA_QUEUE_SCHEDULE_POLICY
+              value: "1"
+            - name: MACA_QUEUE_SCHEDULE_POLICY
+              value: "1"
+            - name: CUDA_SMALL_PAGESIZE_ENABLE
+              value: "1"
+            - name: MACA_SMALL_PAGESIZE_ENABLE
+              value: "1"
+
+            # ── PyTorch / Triton MACA 优化 ──
+            - name: PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM
+              value: "1"
+            - name: TRITON_ENABLE_ELEMENTWISE_PK_FMA_OPT
+              value: "True"
+            - name: TRITON_DISABLE_CUDA_OPT_MMA_PREFETCH
+              value: "1"
+            - name: TRITON_DISABLE_MACA_OPT_MMA_PREFETCH
+              value: "1"
+            - name: TRITON_ENABLE_CUDA_CHAIN_DOT_OPT
+              value: "1"
+            - name: TRITON_ENABLE_MACA_CHAIN_DOT_OPT
+              value: "1"
+            - name: TRITON_ENABLE_CUDA_COMPILER_INT8_OPT
+              value: "1"
+            - name: TRITON_ENABLE_MACA_COMPILER_INT8_OPT
+              value: "1"
+            - name: TRITON_ENABLE_CUDA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP
+              value: "1"
+            - name: TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP
+              value: "1"
+            - name: TORCH_CUDA_ARCH_LIST
+              value: "8.0 8.6+PTX"
+            - name: TORCH_MACA_ARCH_LIST
+              value: "8.0 8.6+PTX"
+
+            # ── MACA GPU 可见性 (C600 拓扑: 0,4,8,12,1,5,9,13,6,2,10,14,7,3,11,15) ──
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0,4,8,12,1,5,9,13,6,2,10,14,7,3,11,15"
+
+            # ── SGLang 优化 ──
+            - name: SGLANG_DISAGGREGATION_QUEUE_SIZE
+              value: "8"
+            - name: SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
+              value: "24"
+            - name: SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK
+              value: "1"
+            - name: USE_INDEX_CACHE
+              value: "1"
+
+            # ── RDMA / IB 网络配置 ──
+            - name: GLOO_SOCKET_IFNAME
+              value: "manage0"
+            - name: NCCL_SOCKET_IFNAME
+              value: "manage0"
+            - name: MCCL_SOCKET_IFNAME
+              value: "manage0"
+            - name: NCCL_IB_HCA
+              value: "=mlx5_0,mlx5_1"
+            - name: MCCL_IB_HCA
+              value: "=mlx5_0,mlx5_1"
+            - name: NVSHMEM_HCA_LIST
+              value: "mlx5_1"
+            - name: MXSHMEM_HCA_LIST
+              value: "mlx5_1"
+            - name: NVSHMEM_DISABLE_CUDA_VMM
+              value: "1"
+            - name: MXSHMEM_DISABLE_MACA_VMM
+              value: "1"
+            - name: NVSHMEM_SYMMETRIC_SIZE
+              value: "3g"
+            - name: MXSHMEM_SYMMETRIC_SIZE
+              value: "3g"
+            - name: NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME
+              value: "manage0"
+            - name: MXSHMEM_BOOTSTRAP_UID_SOCK_IFNAME
+              value: "manage0"
+
+            # ── MACA 沐曦特有环境变量 ──
+            - name: MX_ENABLE_NSA_INDEXER_GEMM_BF16
+              value: "True"
+            - name: MX_ENABLE_FLASH_MLA_METADATA_CACHE
+              value: "True"
+            - name: MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE
+              value: "256"
+
+            # ── DeepEP / Expert 优化 ──
+            - name: EXPERT_RECORD
+              value: "True"
+            - name: FUSED_RMSNORM_QUANT
+              value: "True"
+            - name: USE_SINGLE_STREAM_DISPATCH_OVERLAP
+              value: "True"
+            - name: SGLANG_ENABLE_JIT_DEEPGEMM
+              value: "1"
+            - name: SGLANG_DEEPEP_BF16_DISPATCH
+              value: "1"
+            - name: NV_SGLANG_GLOO_OPT
+              value: "1"
+            - name: MX_SGLANG_GLOO_OPT
+              value: "1"
+
+            # ── Decode 双批次重叠 (默认关闭, 开启时添加 --enable-two-batch-overlap) ──
+            - name: PIPE_OPT_ON_SHARE
+              value: "true"
+
+            # ── Python / 系统 ──
+            - name: PYTHONFAULTHANDLER
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: RES_OPTIONS
+              value: "timeout:1 attempts:1"
+
+          # ── 资源限制 (沐曦 GPU) ──
+          resources:
+            limits:
+              cpu: "64"
+              memory: 1000Gi
+              metax-tech.com/gpu: "8"
+            requests:
+              cpu: "64"
+              memory: 1000Gi
+              metax-tech.com/gpu: "8"
+
+          # ── 安全上下文 (需要 video 组访问 GPU 设备) ──
+          securityContext:
+            privileged: true
+            runAsGroup: 44
+
+          # ── 卷挂载 ──
+          volumeMounts:
+            # 沐曦驱动
+            - mountPath: /opt/mxdriver
+              name: mxdriver
+              readOnly: true
+            # 沐曦设备
+            - mountPath: /dev/mxcd
+              name: mxcd
+            # 共享内存 (NIXL / NCCL)
+            - mountPath: /dev/shm
+              name: shm
+            # 数据存储
+            - mountPath: /workspace/data
+              name: data
+            # SGLang 配置
+            - name: metrics-volume
+              mountPath: /.config
+
+          startupProbe:
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 120
+          livenessProbe:
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          # ── 网络端口 ──
+          ports:
+            - name: modelserver
+              containerPort: 8200
+              protocol: TCP
+            - name: nixl
+              containerPort: 5600
+              protocol: TCP
+
+      volumes:
+        # 沐曦驱动
+        - name: mxdriver
+          hostPath:
+            path: /opt/mxdriver
+        # 沐曦设备
+        - name: mxcd
+          hostPath:
+            path: /dev/mxcd
+        # 共享内存
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        # 数据
+        - name: data
+          hostPath:
+            path: /data
+        # SGLang 配置
+        - name: metrics-volume
+          emptyDir: {}

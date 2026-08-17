@@ -1,0 +1,98 @@
+# SGLang Router (gateway) Deployment — GLM-5.2 PD 分离 (sglang 原生网关, 与 llm-d EPP 并行)
+#
+# 用途: sglang 原生 /generate 协议入口 + /v1/models (压测方案二, 见 pd-stress-test-report.zh.md §5)
+#   与 llm-d EPP (:8081) 并行, 互不影响
+# 实现: 镜像内置 smg (sglang_router python 入口) 直调, 绕过 gateway.sh wrapper
+#   (wrapper 在 CPU-only 节点触发 sdk_arch unbound 崩溃)
+# hostNetwork: 固定在 mxgpu-1-232 (标签 metax-sglang-pd-router), 集群外直连 http://10.0.0.232:8001
+#
+# ── 多入口注册 (smg 原生支持, --prefill / --decode 均可重复, action=append) ──
+# 每个入口 = 一个逻辑实例的 master (worker-index=0 的 pod)。
+#   ⚠️ worker pod 的 8000/8200 是残接口 (/server_info 404), 不可注册。
+# 多实例扩容示例 (2 组 prefill + 1 组 decode 逻辑实例):
+#   smg launch --host=0.0.0.0 --port=8001 --pd-disaggregation \
+#     --prefill http://<prefill-master-A>:8000 \
+#     --prefill http://<prefill-master-B>:8000 \
+#     --decode  http://<decode-master>:8200
+#   (--prefill 还支持可选的 bootstrap 端口: --prefill URL [BOOTSTRAP_PORT])
+# 跨入口负载均衡: --prefill-policy / --decode-policy
+#   (random / round_robin / cache_aware 等, PD 模式默认 cache_aware)
+# ⚠️ LWS 重建后 master 落点可能漂移, 需同步更新下方注册 IP
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glm-router
+  labels:
+    app: glm-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: glm-router
+  template:
+    metadata:
+      labels:
+        app: glm-router
+    spec:
+      serviceAccountName: mx-sglang-pd-lws
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: metax-sglang-pd-router
+                    operator: In
+                    values: ["true"]
+      containers:
+        - name: router
+          image: harbor.mycompany.com/metax/sglang:glmpd
+          imagePullPolicy: Always
+          workingDir: /opt/llm-launch-GLM5/sglang
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              export PATH=/opt/conda/bin:$PATH
+              # §8.4: CPU-only 节点上 smg (python 入口) import sglang 时执行
+              # torch.cuda.get_device_name(0) GPU probe → RuntimeError, 置 False
+              sed -i 's/"MetaX C600" in torch\.cuda\.get_device_name(0)/False/' \
+                /opt/conda/lib/python3.10/site-packages/sglang/srt/utils/common.py
+              export SGLANG_ENABLE_SPECIFIC_DEVICE_OPT=false
+              # 直接调用 smg (绕过 gateway.sh→common.sh→utils.sh 包装,
+              # 后者在 CPU-only 节点触发 sdk_arch unbound 崩溃)
+              # GLM5.2: 注册 prefill/decode master (各 1 个 4 节点逻辑实例)
+              # ⚠️ master = worker-index=0 的 pod, LWS 重建后落点可能漂移
+              #    (worker 的 8000/8200 是残接口 /server_info 404),
+              #    漂移后用 `kubectl get pods -o wide | grep -E "^(prefill|decode)-0 "`
+              #     确认落点并更新此处 IP
+              exec /opt/conda/bin/smg launch \
+                --host=0.0.0.0 --port=8001 \
+                --pd-disaggregation \
+                --health-check-timeout-secs=60 \
+                --prefill http://10.0.0.154:8000 \
+                --decode http://10.0.0.167:8200
+          ports:
+            - name: http
+              containerPort: 8001
+              protocol: TCP
+          resources:
+            requests: { memory: "8Gi", cpu: "4" }
+            limits:   { memory: "16Gi", cpu: "8" }
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+      restartPolicy: Always

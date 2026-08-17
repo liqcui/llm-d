@@ -12,6 +12,10 @@ KUBERNETES_CONTEXT=""
 DEBUG=""
 CENTRAL_MODE=true
 ENABLE_TLS=false
+# Offline/air-gapped deployment support (optional):
+CHART_VERSION="${CHART_VERSION:-}"
+IMAGE_REGISTRY="${IMAGE_REGISTRY:-}"
+IMAGE_PULL_SECRETS="${IMAGE_PULL_SECRETS:-}"
 
 ### HELP & LOGGING ###
 print_help() {
@@ -32,6 +36,10 @@ Options:
 
 Environment Variables:
   MONITORING_NAMESPACE        Override default monitoring namespace
+  CHART_VERSION               Pin the kube-prometheus-stack chart version (e.g. 88.3.0)
+  IMAGE_REGISTRY              Override the image registry for all components
+                              (e.g. harbor.example.com/monitoring)
+  IMAGE_PULL_SECRETS          Name of the imagePullSecret used for IMAGE_REGISTRY
 
 Examples:
   $(basename "$0")                              # Install central monitoring in llm-d-monitoring (watches all namespaces)
@@ -346,6 +354,9 @@ install_prometheus_grafana() {
   local PROMETHEUS_IMAGE_CONFIG=""
   local CHART_VERSION_FLAG=""
   local OPERATOR_EXISTS=false
+  if [[ -n "$CHART_VERSION" ]]; then
+    CHART_VERSION_FLAG="--version ${CHART_VERSION}"
+  fi
   if check_prometheus_operator; then
     DISABLE_PROMETHEUS_OPERATOR="prometheusOperator:\n  enabled: false"
     OPERATOR_EXISTS=true
@@ -386,6 +397,17 @@ install_prometheus_grafana() {
     DISABLE_NODE_EXPORTER="nodeExporter:\n  enabled: false"
   fi
 
+  local GLOBAL_VALUES=""
+  if [[ -n "$IMAGE_REGISTRY" || -n "$IMAGE_PULL_SECRETS" ]]; then
+    GLOBAL_VALUES+="global:\n"
+    if [[ -n "$IMAGE_REGISTRY" ]]; then
+      GLOBAL_VALUES+="  imageRegistry: ${IMAGE_REGISTRY}\n"
+    fi
+    if [[ -n "$IMAGE_PULL_SECRETS" ]]; then
+      GLOBAL_VALUES+="  imagePullSecrets:\n    - name: ${IMAGE_PULL_SECRETS}\n"
+    fi
+  fi
+
   log_info "🚀 Installing Prometheus stack in namespace ${MONITORING_NAMESPACE}..."
 
   # Determine protocol and port for Grafana datasource based on TLS setting
@@ -409,6 +431,7 @@ install_prometheus_grafana() {
 
   if [[ "$CENTRAL_MODE" == "true" ]]; then
     cat <<EOF > /tmp/prometheus-values.yaml
+$(if [[ -n "$GLOBAL_VALUES" ]]; then echo -e "$GLOBAL_VALUES"; fi)
 grafana:
   adminPassword: admin
   service:
@@ -457,6 +480,7 @@ $(if [[ -n "$DISABLE_NODE_EXPORTER" ]]; then echo -e "$DISABLE_NODE_EXPORTER"; f
 EOF
   else
     cat <<EOF > /tmp/prometheus-values.yaml
+$(if [[ -n "$GLOBAL_VALUES" ]]; then echo -e "$GLOBAL_VALUES"; fi)
 grafana:
   adminPassword: admin
   service:
