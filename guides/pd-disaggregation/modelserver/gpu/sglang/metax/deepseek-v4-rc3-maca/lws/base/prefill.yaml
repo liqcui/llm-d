@@ -1,0 +1,399 @@
+# Prefill LeaderWorkerSet — DeepSeek-V4 (rc3-maca) PD 分离
+#
+# 拓扑: LWS replicas=1, size=4 → 1 个 4 节点逻辑实例 (4 pods / 4 节点 / 32 卡)
+#   LWS 自动注入: LWS_WORKER_INDEX → --node-rank (0..3)
+#                 LWS_LEADER_ADDRESS → --dist-init-addr 的 host
+#                 LWS_GROUP_SIZE (4) → --nnodes
+#   并行度: tp=8 dp=4 ep=8 (4 节点各 1 个 DP replica), pp=1
+#   端口:   HTTP 8000; PD bootstrap 8998 (sglang 默认, llm-d sidecar 按此查询)
+#
+# 启动模式 (PD_LAUNCH_MODE, 见 launcher-configmap.yaml 头部):
+#   explicit (默认) 本层显式拼装 launch_server argv, 参数全部可 env 覆盖
+#   official        跑镜像内官方 /workspace/llm-launch/sglang/prefill.sh
+#
+# ⚠ 仅 worker-index=0 是有效入口: worker pod 的 8000 是残接口 (/server_info 404),
+#   InferencePool / headless Service 均按 leaderworkerset.sigs.k8s.io/worker-index="0" 选择。
+#   (与 metax/lws/ GLM 方案一致, 见 TROUBLESHOOTING.md §5)
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: prefill-dsv4rc3
+  labels:
+    llm-d.ai/role: prefill
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 4
+    restartPolicy: RecreateGroupOnPodRestart
+    workerTemplate:
+      metadata:
+        labels:
+          llm-d.ai/role: prefill
+          llm-d.ai/model: deepseek-v4-rc3-maca
+          llm-d.ai/guide: pd-disaggregation
+      spec:
+        hostNetwork: true
+        hostPID: true
+        hostIPC: true
+        # ⚠ hostNetwork: true 时 dnsPolicy: ClusterFirst 会被 kubelet **忽略**,
+        #   实际退化为节点自身的 resolv.conf (等价 Default) —— 集群 DNS 不可用。
+        #   后果: LWS_LEADER_ADDRESS (如 prefill-dsv4rc3-0.prefill-dsv4rc3) 解析不到。
+        #     · rank0 仍可用 (回退 POD_IP, 在 hostNetwork 下即本节点 IP, 正是 master)
+        #     · rank1-3 无法推导 master, 必须显式提供 PD_MASTER_IP (见 env)
+        #   若希望改回用集群 DNS 解析 leader, 将此值改为 ClusterFirstWithHostNet。
+        dnsPolicy: ClusterFirst
+        serviceAccountName: mx-sglang-pd-lws
+        # 宽限期 120s: 降低整组重建时新旧代交接窗口的 MCCL/Gloo 连接污染概率
+        terminationGracePeriodSeconds: 120
+
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: metax-sglang-pd-prefill-dsv4rc3
+                      operator: In
+                      values: ["true"]
+          # size=4 必须落到 4 台不同物理节点
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    llm-d.ai/role: prefill
+                topologyKey: kubernetes.io/hostname
+
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+          supplementalGroups: [44]
+
+        containers:
+          - name: modelserver
+            image: REPLACE_MODEL_SERVER_IMAGE
+            imagePullPolicy: Always
+            workingDir: /workspace
+            command:
+              - bash
+              - -c
+              - |
+                set -euo pipefail
+
+                # hostNetwork 下补全自身 hostname 解析
+                if ! grep -q "${HOSTNAME}" /etc/hosts 2>/dev/null; then
+                  echo "${POD_IP} ${HOSTNAME}" >> /etc/hosts
+                fi
+
+                ulimit -l unlimited || true
+
+                # 预留端口, 避免 hostNetwork 下被随机占用
+                sysctl -w net.ipv4.ip_local_reserved_ports="${PD_HTTP_PORT},${PD_BOOTSTRAP_PORT},${PD_DIST_INIT_PORT}" 2>/dev/null || true
+
+                # C500 JIT 缓存清理 (与 GLM / dsv4 方案对齐)
+                rm -rf /root/.cache/tvm-ffi
+
+                # 日志落盘: hostPath, Pod 重建后仍在
+                mkdir -p /var/log/sglang-dsv4rc3
+                LOG=/var/log/sglang-dsv4rc3/${PD_ROLE}-rank${LWS_WORKER_INDEX:-0}.log
+                echo "[LWS] $(date '+%F %T') group start rank=${LWS_WORKER_INDEX:-0}/${LWS_GROUP_SIZE:-1}" >> "${LOG}"
+
+                # exec + 进程替换: PID1 最终是 python3, 保证 SIGTERM 直达引擎
+                exec bash /workspace/llm-d/pd-launcher.sh > >(tee -a "${LOG}") 2>&1
+            env:
+              # ── 角色 ──
+              - name: PD_ROLE
+                value: "prefill"
+              # sglang 只装在 conda 环境; 不把 /opt/conda/bin 放进 PATH 会导致
+              # python3 -m sglang.launch_server 报 ModuleNotFoundError
+              - name: PATH
+                value: "/opt/conda/bin:/opt/maca/bin:/opt/maca/mxgpu_llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+              - name: PD_PYTHON_BIN
+                value: "/opt/conda/bin/python3"
+              - name: POD_IP
+                valueFrom:
+                  fieldRef: { fieldPath: status.podIP }
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef: { fieldPath: metadata.name }
+              # ⚠ 因 dnsPolicy: ClusterFirst (hostNetwork 下集群 DNS 被忽略),
+              #   LWS leader 域名解析不到, 此值**必须**能得到 leader 的**真实 host IP**。
+              #
+              #   prefill 是 dp=1 (tp=4 × pp=8), 不走 sglang 的 dp-attention 端口握手,
+              #   因此填 ClusterIP 也能起 —— 但**不要**这么做: decode 侧同样写法会死锁
+              #   (详见 decode.yaml 同名变量的注释), 两角色保持同一语义更安全。
+              #
+              # ✅ 留空 = 由 pd-launcher 按优先级解析:
+              #   rank0 用自身 POD_IP; 其余 rank 通过 K8s API 查 leader(<lws>-0) 的 podIP
+              #   (hostNetwork ⇒ podIP 即宿主机 IP)。依赖 rbac.yaml 的 mx-sglang-pd-pod-reader。
+              #   ⚠ 别在组外手工填节点 IP: 整组重建后 leader 可能换节点。
+              - name: PD_MASTER_IP
+                value: ""
+
+              # ── 启动模式 ──
+              # explicit = 本层显式拼装 sglang.launch_server argv (当前使用)
+              #   ⚠ 镜像 0.5.13-maca (MACA 3.8.1.3) **不带厂商 llm-launch 脚本**
+              #     (/workspace/llm-launch 不存在), 只能走 explicit。
+              #     下面取值是把厂商 0.5.8-rc3 prefill.sh 的**实测 argv 1:1 翻译**过来的。
+              #     prefill 与 decode 的差异 (照抄厂商): 有 --disable-cuda-graph /
+              #     --disable-radix-cache / --enable-dynamic-chunking, 但**没有**
+              #     ep-size / dp-attention / moe / deepep 相关项 (见 PD_EXTRA_ARGS)。
+              # official = 跑镜像内 /workspace/llm-launch/sglang/prefill.sh (仅旧镜像有)
+              - name: PD_LAUNCH_MODE
+                value: "explicit"
+
+              # ── explicit 专用: 厂商 prefill.sh 有、decode 没有的开关 ──
+              #   prefill 不抓 CUDA graph (厂商注释: --disable-cuda-graph), 也是 node 36
+              #   那类 graph 捕获期 GPU 故障不会出现在 prefill 的原因。
+              - name: PD_EXTRA_ARGS
+                value: "--disable-cuda-graph --disable-radix-cache --enable-dynamic-chunking"
+              - name: PD_SWA_FULL_TOKENS_RATIO
+                value: "0.2"                      # 厂商 prefill 0.2 (decode 是 0.4)
+              - name: PD_MAX_RUNNING_REQUESTS
+                value: "64"                       # 厂商 prefill_max_running_requests_pre_batch × dp(1)
+              - name: PD_DIST_TIMEOUT
+                value: "300"                      # 厂商 prefill.sh --dist-timeout=300
+
+              # ── 拓扑 (explicit 直接作为 --tp/--pp/--dp-size 传; decode 另传 ep) ──
+              # 厂商默认 (config.sh): pp=models/<spec>.sh 的 prefill_pp_size_specific(8)
+              #                       tp=nnodes×num_dies/pp = 4×8/8 = 4
+              #                       dp=get_prefill_dp_size() = 1
+              # 下面写死的就是厂商默认值。
+              - name: PD_TP_SIZE
+                value: "4"
+              - name: PD_PP_SIZE
+                value: "8"
+              - name: PD_DP_SIZE
+                value: "1"
+
+              # ── 显存 / 上下文 / chunk: 回写 config.sh + models/<spec>.sh ──
+              # 厂商 prefill 侧 mem fraction 是硬编码函数, 恒为 0.82
+              - name: PD_MEM_FRACTION_STATIC
+                value: "0.82"
+              - name: PD_CONTEXT_LENGTH
+                value: "131072"                   # 厂商 context_length_specific = 1024×128
+              - name: PD_CHUNKED_PREFILL_SIZE
+                value: "4096"                     # 厂商 chunked_prefill_size_default
+
+              # ── 网卡 / disagg 设备 (厂商默认 mlx5_bond_*, 本环境不同, 必须回写) ──
+              #   hca_list          → NCCL_IB_HCA / NVSHMEM_HCA_LIST
+              #   mooncake_ib_device → --disaggregation-ib-device (config.sh:157) + MOONCAKE_DEVICE
+              - name: PD_HCA_LIST
+                value: "mlx5_0,mlx5_1"
+              - name: PD_MOONCAKE_IB_DEVICE
+                value: "mlx5_0,mlx5_1"
+
+              # ── 结构参数 ──
+              - name: PD_MODEL_PATH
+                value: "/workspace/data/DeepSeek-V4-Flash-FlexSMQ-AWQ-W8A8"
+              - name: PD_HTTP_PORT
+                value: "8000"
+              - name: PD_BOOTSTRAP_PORT
+                value: "8998"
+              - name: PD_DIST_INIT_PORT
+                value: "5000"
+              - name: PD_HOST
+                value: "0.0.0.0"
+
+              # 厂商 config.sh 里 --enable-metrics 是注释状态;
+              # 本项目要 Prometheus/Grafana 采集 → 解锁 (置 0 则保持厂商默认=关闭)
+              - name: PD_ENABLE_METRICS
+                value: "1"
+
+              # ── DeepEP (厂商 decode.sh 会读该值推导 chunked-prefill-size) ──
+              #   本变量在下方「沐曦平台环境」块给出 (official/explicit 都生效;
+              #   不在 _official_unset_explicit_envs 清单内)
+
+              # ══════════════════════════════════════════════════════════
+              # 以下为 explicit 模式专用参数 (official 模式下不生效):
+              #   PD_DTYPE / PD_QUANTIZATION / PD_KV_CACHE_DTYPE
+              #     → official 由 models/<spec>.sh 的 prefill_decode_model_args 提供
+              #       (--kv-cache-dtype bf16 --quantization w8a8_int8 ...)
+              #   PD_MAX_RUNNING_REQUESTS / PD_MAX_PREFILL_TOKENS / PD_CUDA_GRAPH_MAX_BS
+              #   PD_SWA_FULL_TOKENS_RATIO / PD_LOAD_BALANCE_METHOD / PD_WATCHDOG_TIMEOUT
+              #   PD_MOE_A2A_BACKEND / PD_MOE_RUNNER_BACKEND / PD_MOE_DENSE_TP_SIZE / PD_DEEPEP_MODE
+              #   PD_DISAGG_IB_DEVICE (official 用 PD_MOONCAKE_IB_DEVICE)
+              #   PD_SPECULATIVE_* (prefill 不跑投机解码) / PD_EPLB_ENABLE / PD_EPLB_FILE
+              #   PD_PREFILL_ROUND_ROBIN_BALANCE (official 由 decode.sh 按版本自行添加)
+              #   PD_EXTRA_ARGS
+              # 切回 explicit 时把需要的项取消注释即可 (脚本内均有默认值)。
+              # ══════════════════════════════════════════════════════════
+
+              # ── 沐曦平台环境 ──
+              - name: CUDA_PATH
+                value: "/opt/maca/tools/cu-bridge"
+              - name: MACA_PATH
+                value: "/opt/maca"
+              - name: CUDA_QUEUE_SCHEDULE_POLICY
+                value: "1"
+              - name: MACA_QUEUE_SCHEDULE_POLICY
+                value: "1"
+              - name: CUDA_SMALL_PAGESIZE_ENABLE
+                value: "1"
+              - name: MACA_SMALL_PAGESIZE_ENABLE
+                value: "1"
+              - name: MACA_DIRECT_DISPATCH
+                value: "1"
+              - name: MACA_KERNEL_ARGS_POLICY
+                value: "0x010E"
+              - name: MACA_GRAPH_OPTIMIZE_POLICY
+                value: "0x1"
+              - name: MACA_GRAPH_LAUNCH_QUEUE_POLICY
+                value: "3"
+              - name: MACA_RING_BUFFER_SIZE
+                value: "16384"
+              - name: TVM_FFI_CUDA_ARCH_LIST
+                value: "8.0 8.6"
+              - name: MXSHMEM_HCA_LIST
+                value: "mlx5_1"
+              # ifname 由 launcher 按默认路由探测后导出 (见 PD_SOCKET_IFNAME=auto)
+              - name: NVSHMEM_DISABLE_CUDA_VMM
+                value: "1"
+              - name: MXSHMEM_DISABLE_MACA_VMM
+                value: "1"
+              - name: NVSHMEM_SYMMETRIC_SIZE
+                value: "3g"
+              - name: MXSHMEM_SYMMETRIC_SIZE
+                value: "3g"
+              - name: NVSHMEM_HCA_LIST
+                value: "mlx5_1"
+              - name: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN
+                value: "1"
+              - name: TRITON_ENABLE_ELEMENTWISE_PK_FMA_OPT
+                value: "True"
+              - name: TRITON_DISABLE_CUDA_OPT_MMA_PREFETCH
+                value: "1"
+              - name: TRITON_DISABLE_MACA_OPT_MMA_PREFETCH
+                value: "1"
+              - name: TRITON_ENABLE_CUDA_CHAIN_DOT_OPT
+                value: "1"
+              - name: TRITON_ENABLE_MACA_CHAIN_DOT_OPT
+                value: "1"
+              - name: TRITON_ENABLE_CUDA_COMPILER_INT8_OPT
+                value: "1"
+              - name: TRITON_ENABLE_MACA_COMPILER_INT8_OPT
+                value: "1"
+              - name: TRITON_ENABLE_CUDA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP
+                value: "1"
+              - name: TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP
+                value: "1"
+              - name: TORCH_CUDA_ARCH_LIST
+                value: "8.0 8.6+PTX"
+              - name: TORCH_MACA_ARCH_LIST
+                value: "8.0 8.6+PTX"
+              - name: PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM
+                value: "1"
+              # MCCL/MXSHMEM 网卡配置 — 按实际环境修改 (官方文档: 计算网卡列表)
+              #   ⚠ PD_HCA_LIST 已在上方「网卡 / disagg 设备」块定义 (official 模式的
+              #     回写源), 此处不再重复 —— 同名 env 在 Pod 里是非法重复项。
+              # ⚠ 网卡名 **不要写死**: 本集群 mxgpu-3-28 的 IP 在 br-lan 上, manage0
+              #   无地址 → 写死 manage0 会让 Gloo 报 "Unable to find address for: manage0"
+              #   (scheduler 全灭)。explicit 模式由 launcher 按默认路由自动探测
+              #   (= 厂商 get_net_primary_iface 的行为), 下面 4 个 ifname 变量由它导出,
+              #   这里只留 PD_SOCKET_IFNAME=auto 作为总开关。
+              - name: PD_SOCKET_IFNAME
+                value: "auto"
+              - name: NCCL_IB_HCA
+                value: "=mlx5_0,mlx5_1"
+              - name: MCCL_IB_HCA
+                value: "=mlx5_0,mlx5_1"
+              - name: SGLANG_DISAGGREGATION_QUEUE_SIZE
+                value: "8"
+              - name: SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
+                value: "24"
+              # ⚠ DeepEP low_latency 硬约束: 该值必须 <= 1024
+              #   (deepep.py:334 assert num_max_dispatch_tokens_per_rank <= 1024)
+              #   推荐配置里的 8192 在 low_latency 下会被断言拒绝;
+              #   取 GPUStack 已验证 DS 配置里的 256。
+              - name: SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+                value: "256"
+              - name: SGLANG_JIT_DEEPGEMM_PRECOMPILE
+                value: "0"
+              - name: SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+                value: "1"
+              # USE_INDEX_CACHE 已随镜像更新移除: 0.5.13-maca 镜像内已无此变量
+              # (rc3 fork 专属), 设了不生效。
+              - name: SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD
+                value: "0"
+              # fork 默认 True → disagg prefill idle 时池核算微差即 raise
+              # 杀死 scheduler; 恢复上游默认 False (仅告警)
+              - name: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
+                value: "false"
+              - name: PYTHONFAULTHANDLER
+                value: "1"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: RES_OPTIONS
+                value: "timeout:1 attempts:1"
+            securityContext:
+              privileged: true
+            ports:
+              - name: http
+                containerPort: 8000
+                protocol: TCP
+              - name: bootstrap
+                containerPort: 8998
+                protocol: TCP
+              - name: nixl
+                containerPort: 5600
+                protocol: TCP
+              - name: dist-init
+                containerPort: 5000
+                protocol: TCP
+            resources:
+              limits:   { memory: "1000Gi", cpu: "160", "metax-tech.com/gpu": "8" }
+              requests: { memory: "32Gi", cpu: "8", "metax-tech.com/gpu": "8" }
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: model-data
+                mountPath: /workspace/data
+              - name: mxdriver
+                mountPath: /opt/mxdriver
+                readOnly: true
+              - name: mxcd
+                mountPath: /dev/mxcd
+              - name: sglang-log
+                mountPath: /var/log/sglang-dsv4rc3
+              - name: pd-launcher
+                mountPath: /workspace/llm-d
+                readOnly: true
+            # ⚠ LWS restartPolicy=RecreateGroupOnPodRestart: **任一容器重启都会整组重建**
+            #   (重新加载 32 卡权重 ≈ 4-6 min)。探针因此要容忍慢启动/瞬时无响应 ——
+            #   宁可晚判失败, 也不要因探针抖动把整组推倒重来。
+            startupProbe:                # 最长容忍 ≈ 120 min
+              httpGet:
+                path: /health
+                port: http
+              initialDelaySeconds: 120
+              periodSeconds: 30
+              timeoutSeconds: 10
+              failureThreshold: 236
+            livenessProbe:               # 判定失败前容忍 10 min
+              httpGet:
+                path: /health
+                port: http
+              periodSeconds: 15
+              timeoutSeconds: 10
+              failureThreshold: 40
+            readinessProbe:              # 只影响是否接流量, 不影响重建
+              httpGet:
+                path: /health
+                port: http
+              periodSeconds: 10
+              timeoutSeconds: 10
+              failureThreshold: 3
+
+        volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 100Gi }
+          - name: model-data
+            hostPath: { path: /data, type: DirectoryOrCreate }
+          - name: mxdriver
+            hostPath: { path: /opt/mxdriver, type: DirectoryOrCreate }
+          - name: mxcd
+            hostPath: { path: /dev/mxcd, type: CharDevice }
+          - name: sglang-log
+            hostPath: { path: /var/log/sglang-dsv4rc3, type: DirectoryOrCreate }
+          - name: pd-launcher
+            configMap:
+              name: pd-launcher
+              defaultMode: 0555

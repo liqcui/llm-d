@@ -1,0 +1,55 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 沐曦 (MetaX) SGLang PD 分离 — DeepSeek-V4 (rc3-maca 镜像) — 4 Prefill 卡 + 4 Decode 卡
+#
+# ⚠️ 独立部署: 与 GLM (metax/lws/) 及 DeepSeek-V4-Flash (metax/deepseek-v4-flash/)
+#             完全分离, 互不影响。三者使用互斥的节点标签。
+#
+# 拓扑 (每角色 1 个 4 节点逻辑实例, 共 8 节点 64 卡):
+#   Prefill LWS: replicas=1 size=4 → 4 pods / 4 节点 / 32 卡  (tp=8 dp=4 ep=8, HTTP :8000)
+#   Decode  LWS: replicas=1 size=4 → 4 pods / 4 节点 / 32 卡  (tp=8 dp=4 ep=8, :8200)
+#                每 decode pod 带 routing-proxy sidecar (:8000, kv-connector=sglang)
+#   访问链路:   Client → EPP → decode sidecar:8000 → prefill:8000 / decode modelserver:8200
+#               Client → sglang router:8001 (对比网关, 同一后端)
+#
+# 部署前:
+#   1. LWS CRD 已装 (leaderworkerset.x-k8s.io/v1)
+#   2. 模型: 全部 8 个候选节点宿主机 /data/DeepSeek-V4-Flash-FlexSMQ-AWQ-W8A8 存在 (hostPath)
+#   3. 节点标签 (hostNetwork 端口冲突, 各角色节点互斥; size=4 需每角色 ≥4 台):
+#        prefill ×4: kubectl label node <node> metax-sglang-pd-prefill-dsv4rc3=true --overwrite
+#        decode  ×4: kubectl label node <node> metax-sglang-pd-decode-dsv4rc3=true  --overwrite
+#        router  ×1: kubectl label node <node> metax-sglang-pd-router-dsv4rc3=true  --overwrite
+#   4. RDMA: 节点 mlx5_0/mlx5_1 应为 IB ACTIVE; manage0 为管理网口
+#      (以上网卡名可用 prefill/decode.yaml 的 PD_HCA_LIST / PD_SOCKET_IFNAME 调整)
+#   5. InferencePool pd-disaggregation (Helm 管理) selector 匹配
+#      llm-d.ai/guide=pd-disaggregation + leaderworkerset.sigs.k8s.io/worker-index="0",
+#      targetPort 8000
+#   6. 用 sglang router 对比网关时, 需在 base/router.yaml 填 PD_PREFILL_ENDPOINTS /
+#      PD_DECODE_ENDPOINTS (各 master pod 的 <ip>:<port>)
+#
+# 参数调整: 只改 base/prefill.yaml 与 base/decode.yaml 的 env: 块。
+#   两种启动模式由 PD_LAUNCH_MODE 选择 (explicit=本层拼装 argv / official=跑镜像内
+#   官方脚本), 详见 base/launcher-configmap.yaml 头部说明与 README。
+
+namespace: metax-ai-pd
+
+resources:
+  - base
+
+# 镜像集中覆盖: 换仓库/换 tag 只改这里
+images:
+  # ⚠ 2026-09-24 换镜像: rc3-maca (MACA 3.7.1.9, 0.5.8) → 0.5.13-maca (MACA 3.8.1.3)
+  #   原因: 新集群节点驱动栈是 MACA 3.8.1.3 / 内核模块 3.9.6, 与 rc3 镜像的
+  #   3.7.1.9 用户态不匹配 → decode 在 CUDA graph 捕获期稳定报 mcErrorIllegalAddress
+  #   (TROUBLESHOOTING §13)。0.5.13 镜像无厂商 llm-launch 脚本, 因此两个 LWS 都
+  #   改用 PD_LAUNCH_MODE=explicit (标准 sglang.launch_server 命令)。
+  - name: REPLACE_MODEL_SERVER_IMAGE
+    newName: harbor.isuanova.com/metax/sglang
+    newTag: 0.5.13-maca.ai3.8.1.3-torch2.10-py312-ubuntu22.04-amd64
+  - name: REPLACE_ROUTING_SIDECAR_IMAGE
+    # 离线环境: 侧车镜像来自集群内 registry (节点 /etc/hosts 将
+    # registry.cubestack.io 指向内网 registry, containerd 走 HTTP 拉取)。
+    # 离线归档只有 v0.9.0, 故此处用 v0.9.0。
+    newName: registry.cubestack.io:5000/llm-d/llm-d-router-disagg-sidecar
+    newTag: v0.9.0

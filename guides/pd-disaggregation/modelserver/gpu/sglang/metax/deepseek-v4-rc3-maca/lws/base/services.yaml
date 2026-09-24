@@ -1,0 +1,133 @@
+# Headless Services — DeepSeek-V4 (rc3-maca) PD 分离
+#
+# ⚠ selector 同时匹配 leaderworkerset.sigs.k8s.io/worker-index="0":
+#   LWS size=4 时一个组有 4 个 pod, 但只有 worker-index=0 (leader) 是有效入口,
+#   其余 worker 的 HTTP 端口是残接口 (/server_info 404)。若把 4 个 pod 全部
+#   发布, EPP 会把请求路由到不服务的 rank, 表现为 decode handshake 失败。
+#   (与 metax/lws/ GLM 方案同一约束, 见 TROUBLESHOOTING.md §5)
+apiVersion: v1
+kind: Service
+metadata:
+  name: prefill-headless
+  labels:
+    llm-d.ai/role: prefill
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  clusterIP: None
+  selector:
+    llm-d.ai/role: prefill
+    leaderworkerset.sigs.k8s.io/worker-index: "0"
+  ports:
+    - name: modelserver
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+    - name: bootstrap
+      port: 8998
+      targetPort: 8998
+      protocol: TCP
+    - name: nixl
+      port: 5600
+      targetPort: 5600
+      protocol: TCP
+    - name: dist-init
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
+---
+# ── leader 稳定入口 (普通 ClusterIP, 非 headless) ──
+# 用途: **给客户端**用的稳定地址 (sglang 对比网关 router.yaml 的
+#   PD_PREFILL_ENDPOINTS / PD_DECODE_ENDPOINTS 就填这两个 ClusterIP:端口)。
+#   ClusterIP 由 kube-proxy 转发到 "worker-index=0" 那个 pod, leader 漂移到哪台
+#   节点都成立 —— 普通客户端连 ClusterIP 是单点 TCP 连接, 这条路没问题。
+#
+# ⛔ 但**不能**把它填进 PD_MASTER_IP / --dist-init-addr:
+#   decode 开了 --enable-dp-attention, sglang 会从 --dist-init-addr 推导 ZMQ 握手
+#   端点 tcp://<host>:<port+13> 并要求其余节点直连 node0; ClusterIP 在每个节点上
+#   都是本地地址 (kube-ipvs0) 且没有该端口的 IPVS 规则 → 握手永远建不起来,
+#   node0 阻塞、其余节点 600s 超时退出、RecreateGroupOnPodRestart 无限重建。
+#   PD_MASTER_IP 应留空, 由 pd-launcher 通过 K8s API 取 leader pod 的真实 host IP
+#   (详见 decode.yaml 中 PD_MASTER_IP 的注释与 TROUBLESHOOTING §12)。
+#
+# 为什么不用 LWS leader 的 DNS 名: 实测 <pod>.<headless-svc> 的 A 记录在
+# NodeLocalDNS 下会返回不一致的结果 —— 4 个 rank 分别解析出 .33/.33/.33/.35,
+# 而真正的 leader(rank0) 在 .35。各组会连到不同 master, 分布式初始化直接分裂。
+apiVersion: v1
+kind: Service
+metadata:
+  name: prefill-dist-master
+  labels:
+    llm-d.ai/role: prefill
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  # 必须: 否则形成引导死锁 —— rank0 未 ready 就没有 endpoint, 而 rank1-3 要靠这个
+  # ClusterIP 才能连上 rank0, rank0 又要等全部 rank 到齐才 ready。
+  publishNotReadyAddresses: true
+  selector:
+    llm-d.ai/role: prefill
+    leaderworkerset.sigs.k8s.io/worker-index: "0"
+  ports:
+    - name: dist-init
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: decode-dist-master
+  labels:
+    llm-d.ai/role: decode
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  publishNotReadyAddresses: true
+  selector:
+    llm-d.ai/role: decode
+    leaderworkerset.sigs.k8s.io/worker-index: "0"
+  ports:
+    - name: dist-init
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
+    - name: sidecar
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+    - name: modelserver
+      port: 8200
+      targetPort: 8200
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: decode-headless
+  labels:
+    llm-d.ai/role: decode
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  clusterIP: None
+  selector:
+    llm-d.ai/role: decode
+    leaderworkerset.sigs.k8s.io/worker-index: "0"
+  ports:
+    - name: sidecar
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+    - name: modelserver
+      port: 8200
+      targetPort: 8200
+      protocol: TCP
+    - name: nixl
+      port: 5600
+      targetPort: 5600
+      protocol: TCP
+    - name: dist-init
+      port: 5000
+      targetPort: 5000
+      protocol: TCP

@@ -1,0 +1,137 @@
+# SGLang Router Deployment — DeepSeek-V4 (rc3-maca) (sglang 默认网关, 与 llm-d EPP 并行)
+#
+# 用途: 与 llm-d EPP 网关做性能对比的第二个入口, 同一套 4P+4D 后端。
+#   集群外直连: http://<router 节点 IP>:8001/v1/chat/completions
+#   Metrics:    http://<router 节点 IP>:29000/metrics
+#
+# 与 deepseek-v4-flash/router.yaml 的差异:
+#   原方案把 8 个 worker 地址写死在 args 里, 节点漂移后需手工改 YAML 重启。
+#   这里改为 env 驱动的逗号分隔列表, 改地址只动 env, 不动命令。
+#
+# ⚠ 地址必须指向各实例的 worker-index=0 (master) pod:
+#   --prefill <ip>:8000 8998  (第二参数是 prefill 的 PD bootstrap 端口)
+#   --decode  <ip>:8200
+#   其余 worker 不服务 HTTP。
+#
+# ⚠ 推荐配置里的 --load-balance-method / --prefill-round-robin-balance 属于
+#   launch_server; router 侧的等价开关是 --policy / --prefill-policy。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek-v4-rc3-router
+  labels:
+    app: deepseek-v4-rc3-router
+    llm-d.ai/model: deepseek-v4-rc3-maca
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseek-v4-rc3-router
+  template:
+    metadata:
+      labels:
+        app: deepseek-v4-rc3-router
+        llm-d.ai/model: deepseek-v4-rc3-maca
+    spec:
+      serviceAccountName: mx-sglang-pd-lws
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: metax-sglang-pd-router-dsv4rc3
+                    operator: In
+                    values: ["true"]
+      containers:
+        - name: router
+          image: REPLACE_MODEL_SERVER_IMAGE
+          imagePullPolicy: Always
+          workingDir: /workspace
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+
+              # RC 镜像 import SGLang 时会做 GPU device probe, CPU-only router 会崩:
+              # 关闭 device opt + 打掉 import 期的 torch.cuda.get_device_name(0)
+              export SGLANG_ENABLE_SPECIFIC_DEVICE_OPT=false
+              _common_py=/opt/conda/lib/python3.10/site-packages/sglang/srt/utils/common.py
+              if [ -f "${_common_py}" ]; then
+                sed -i 's/"MetaX C600" in torch\.cuda\.get_device_name(0)/False/' "${_common_py}" || true
+              fi
+
+              [ -n "${PD_PREFILL_ENDPOINTS:-}" ] || { echo "[ROUTER][ERROR] PD_PREFILL_ENDPOINTS 未设置" >&2; exit 1; }
+              [ -n "${PD_DECODE_ENDPOINTS:-}"  ] || { echo "[ROUTER][ERROR] PD_DECODE_ENDPOINTS 未设置"  >&2; exit 1; }
+
+              _norm() { local e="$1"; e="${e#http://}"; e="${e#https://}"; printf '%s' "${e%/}"; }
+
+              PRE_ARGS=()
+              IFS=',' read -ra _pf <<< "${PD_PREFILL_ENDPOINTS}"
+              for ep in "${_pf[@]}"; do
+                [ -z "${ep}" ] && continue
+                PRE_ARGS+=( --prefill "http://$(_norm "${ep}")" "${PD_BOOTSTRAP_PORT}" )
+              done
+
+              DEC_ARGS=()
+              IFS=',' read -ra _dc <<< "${PD_DECODE_ENDPOINTS}"
+              for ep in "${_dc[@]}"; do
+                [ -z "${ep}" ] && continue
+                DEC_ARGS+=( --decode "http://$(_norm "${ep}")" )
+              done
+
+              echo "[ROUTER] prefill=${#PRE_ARGS[@]} 项 decode=${#DEC_ARGS[@]} 项 (bootstrap=${PD_BOOTSTRAP_PORT})"
+
+              exec /opt/conda/bin/python3 -m sglang_router.launch_router \
+                --pd-disaggregation \
+                "${PRE_ARGS[@]}" \
+                "${DEC_ARGS[@]}" \
+                --host 0.0.0.0 --port "${PD_ROUTER_HTTP_PORT}" \
+                --prometheus-host 0.0.0.0 --prometheus-port "${PD_ROUTER_METRICS_PORT}" \
+                --request-timeout-secs 18000 --health-check-timeout-secs 90
+          env:
+            # 逗号分隔的 "<ip>:<port>" 列表。
+            # 取值为 services.yaml 的 *-dist-master **ClusterIP** (稳定指向 worker-index=0):
+            #   prefill → prefill-dist-master:8000   decode → decode-dist-master:8200
+            # ✅ 这里是**客户端**连接, 走 ClusterIP 没问题 (IPVS 单点转发)。
+            # ⛔ 同一对 ClusterIP 不要拿去填 PD_MASTER_IP: dp-attention 的 ZMQ 握手
+            #    要求直连 node0 的真实 IP, 填 ClusterIP 会死锁 (见 decode.yaml 注释)。
+            # ⚠ ClusterIP 首次创建时分配, 换集群/重建会变:
+            #   kubectl -n metax-ai-pd get svc prefill-dist-master decode-dist-master
+            - name: PD_PREFILL_ENDPOINTS
+              value: "10.233.22.217:8000"
+            - name: PD_DECODE_ENDPOINTS
+              value: "10.233.63.143:8200"
+            - name: PD_BOOTSTRAP_PORT
+              value: "8998"
+            - name: PD_ROUTER_HTTP_PORT
+              value: "8001"
+            - name: PD_ROUTER_METRICS_PORT
+              value: "29000"
+          ports:
+            - name: http
+              containerPort: 8001
+              protocol: TCP
+            - name: metrics
+              containerPort: 29000
+              protocol: TCP
+          resources:
+            requests: { memory: "8Gi", cpu: "4" }
+            limits:   { memory: "16Gi", cpu: "8" }
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+      restartPolicy: Always

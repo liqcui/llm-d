@@ -1,0 +1,719 @@
+# PD Launcher (双模式启动器) — 以 ConfigMap 形式挂载, 不放入镜像
+#
+# ══════════════════════════════════════════════════════════════════════
+# 两种启动模式, 由 PD_LAUNCH_MODE 选择:
+#
+#   official (默认) 跑官方脚本 (镜像内 /workspace/llm-launch)
+#       exec <llm-launch>/sglang/{prefill,decode}.sh <spec> <master> <nnodes> <rank>
+#       完全复用官方 config.sh / models/<spec>.sh 的默认值: 显存 profile 表、
+#       EPLB 权重加载、版本相关的 env(0.5.7/0.5.8/0.5.10 分支)、C500 JIT wrapper、
+#       网卡自动探测等。参考 GPUStack start_pd.sh 的适配层设计。
+#       本层只做四件事:
+#         ① 拓扑注入 (LWS → master / nnodes / rank)
+#         ② **env → 厂商脚本变量回写** (PP/TP/EP/DP 与常用调优项; 见下表)
+#         ③ Port / Host / Bootstrap 覆盖 (只在容器可写层 sed, 不改镜像)
+#         ④ 启动摘要 (打印回写后的**有效值**)
+#       ⚠ 未显式设置的项一律不回写 = 保持厂商默认; 这样才能"改一项只动一项"。
+#
+#   explicit 绕过官方脚本, 逃生舱
+#       由 env 显式拼装 `python3 -m sglang.launch_server` 的完整 argv。
+#       参数完全可控、可审计, 但**厂商脚本里的东西都要自己补齐** —— 实测踩过:
+#       DSv4 行为开关、HCA 名、显存 profile 表、版本相关 env 一旦漏掉就会走
+#       非验证路径。除非在排查官方路径本身, 否则优先用 official。
+#
+# 两种模式共用同一套拓扑解析与校验逻辑。
+# ══════════════════════════════════════════════════════════════════════
+#
+# === 共用 ===
+# PD_ROLE                     (必填) prefill | decode
+# PD_LAUNCH_MODE              official | explicit  (默认 official)
+# PD_MASTER_IP                (可选) 解析不到 LWS leader 时的回退 master IP
+# PD_DRY_RUN                  (可选) 非空只打印不拉起 (official 模式仍会做回写+摘要)
+#
+# === LWS 自动注入 (无需配置) ===
+# LWS_WORKER_INDEX → --node-rank     LWS_LEADER_ADDRESS → master
+# LWS_GROUP_SIZE   → --nnodes
+#
+# === env → 厂商脚本变量回写 (两种模式共用同一套 env; 仅 official 生效回写) ===
+#   PD_TP_SIZE / PD_DP_SIZE / PD_EP_SIZE / PD_PP_SIZE
+#        → config.sh  {decode,prefill}_{tp,dp,ep,pp}_size
+#     厂商默认: decode dp=ep=tp=nnodes×num_dies, pp=1
+#               prefill pp=models/<spec>.sh 的 prefill_pp_size_specific,
+#                       tp=nnodes×num_dies/pp, dp=get_prefill_dp_size()
+#   PD_MEM_FRACTION_STATIC → config.sh {decode,prefill}_mem_fraction_static
+#     (厂商是 get_*_mem_fraction_static(gpu,dp,mtp) 查表; 表里没本 GPU 会查空 →
+#      必须回写, 且该值受 EAGLE draft worker 显存约束, 见 TROUBLESHOOTING §8)
+#   PD_CONTEXT_LENGTH       → models/<spec>.sh context_length_specific
+#   PD_CHUNKED_PREFILL_SIZE → models/<spec>.sh chunked_prefill_size_default
+#   PD_MODEL_PATH           → models/<spec>.sh model_path_specific
+#     (厂商脚本硬编码 /bgfs/models/...; hostPath 挂载到别处时必须回写)
+#   PD_SPECULATIVE_ENABLE=0 → models/<spec>.sh decode_mtp_specific=1 (关 MTP)
+#   PD_SPECULATIVE_NUM_DRAFT_TOKENS → models/<spec>.sh decode_mtp_specific
+#     (厂商 decode.sh 由此推导 --speculative-num-steps=draft-1, topk=1)
+#   PD_EPLB_ENABLE / PD_EPLB_FILE → models/<spec>.sh decode_eplb_file_specific
+#     (官方 decode.sh 仅当该变量非空才加 --enable-eplb --init-expert-location;
+#      文件不存在时本层回写空值=关闭 EPLB, 避免拉起时才发现路径不存在)
+#   PD_HCA_LIST / PD_MOONCAKE_IB_DEVICE → config.sh hca_list / mooncake_ib_device
+#     (厂商默认是 mlx5_bond_*; 本环境为 mlx5_0,mlx5_1。mooncake_ib_device 同时是
+#      --disaggregation-ib-device 的取值, 见 config.sh:157)
+#   PD_ENABLE_METRICS=1 → 解锁 config.sh 里被注释的 --enable-metrics
+#     厂商默认关闭(注释状态); 本项目要 Prometheus/Grafana 采集, 默认置 1
+#   prefill_max_running_requests_pre_batch / decode_max_running_requests_specific
+#        → 厂商原变量名 (GPUStack 同名约定), 直接回写
+#     注意 decode_max_running_requests_specific 是**每 DP rank** 上限,
+#     官方 decode.sh 会 ×dp_size 作为总并发; 与 explicit 模式的
+#     PD_MAX_RUNNING_REQUESTS(总并发) 语义不同, 故不互相映射。
+#
+# === explicit 模式参数 ===
+# PD_MODEL_PATH / PD_DTYPE / PD_QUANTIZATION / PD_CONTEXT_LENGTH / PD_KV_CACHE_DTYPE
+# PD_TP_SIZE / PD_PP_SIZE / PD_DP_SIZE / PD_EP_SIZE
+# PD_HTTP_PORT / PD_BOOTSTRAP_PORT / PD_DIST_INIT_PORT
+# PD_DISAGG_IB_DEVICE / PD_HOST / PD_WORKDIR
+# PD_MEM_FRACTION_STATIC / PD_MAX_RUNNING_REQUESTS / PD_MAX_PREFILL_TOKENS
+# PD_CHUNKED_PREFILL_SIZE / PD_CUDA_GRAPH_MAX_BS / PD_SWA_FULL_TOKENS_RATIO
+# PD_WATCHDOG_TIMEOUT / PD_LOAD_BALANCE_METHOD
+# PD_MOE_A2A_BACKEND / PD_MOE_RUNNER_BACKEND / PD_MOE_DENSE_TP_SIZE / PD_DEEPEP_MODE
+# PD_SPECULATIVE_ENABLE 1=加 EAGLE (prefill 默认 0, decode 默认 1)
+# PD_SPECULATIVE_ALGO / PD_SPECULATIVE_EAGLE_TOPK
+# PD_SPECULATIVE_NUM_DRAFT_TOKENS / PD_SPECULATIVE_NUM_STEPS
+# PD_PREFILL_ROUND_ROBIN_BALANCE  ⚠ 未验证 flag, 置 0 可关闭
+# PD_EPLB_ENABLE / PD_EPLB_FILE / PD_EPLB_FLAG (auto=从镜像脚本探测)
+# PD_EXTRA_ARGS               自由追加 argv (仅 explicit 模式)
+#
+# === official 模式参数 ===
+# LLM_LAUNCH_DIR             官方脚本目录 (默认 /workspace/llm-launch/sglang)
+# PD_MODEL_SPEC              模型脚本名 (默认 deepseek-v4-flash), 对应 models/<spec>.sh
+# SKIP_PORT_OVERRIDE         非空=不覆盖 config.sh 的 prefill/decode_server_port
+# SKIP_HOST_OVERRIDE         非空=不强制 --host=0.0.0.0
+# SKIP_BOOTSTRAP_OVERRIDE    非空=不覆盖 --disaggregation-bootstrap-port
+# 以下环境变量按 GPUStack 适配层惯例, 同名回写到 config.sh / models/<spec>.sh:
+#   prefill_max_running_requests_pre_batch / decode_max_running_requests_specific
+#   decode_mtp_specific / decode_eplb_file_specific
+#
+# ⚠ official 模式会**清除 explicit 专用环境变量** (USE_INDEX_CACHE /
+#   USE_SINGLE_STREAM_DISPATCH_OVERLAP / SGLANG_DEEPEP_BF16_DISPATCH /
+#   SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER / MX_SGLANG_ENABLE_KV_LAYOUT_FIX 及
+#   厂商 config.sh 自行 export 的网卡/架构变量), 否则会覆盖厂商脚本决定的值,
+#   变成"名为对齐、实为偏离"。清单见 _official_unset_explicit_envs()。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pd-launcher
+  labels:
+    llm-d.ai/guide: pd-disaggregation
+data:
+  pd-launcher.sh: |
+    #!/bin/bash
+    # pd-launcher.sh — DeepSeek-V4 (rc3-maca) PD 分离双模式启动器
+    set -euo pipefail
+
+    log()  { echo "[pd-launcher] $*"; }
+    warn() { echo "[pd-launcher][WARN] $*"; }
+    die()  { echo "[pd-launcher][ERROR] $*" >&2; exit 1; }
+
+    # ==========================================================
+    # 0. 角色 / 模式校验
+    # ==========================================================
+    case "${PD_ROLE:-}" in
+      prefill|decode) ;;
+      *) die "PD_ROLE 必须为 prefill 或 decode (当前: '${PD_ROLE:-<未设置>}')" ;;
+    esac
+
+    PD_LAUNCH_MODE="${PD_LAUNCH_MODE:-official}"
+    case "${PD_LAUNCH_MODE}" in
+      explicit|official) ;;
+      *) die "PD_LAUNCH_MODE 必须为 explicit 或 official (当前: '${PD_LAUNCH_MODE}')" ;;
+    esac
+
+    # ==========================================================
+    # 0.5 解释器探测
+    #   实测: 本镜像 sglang 只装在 conda 环境, 系统 /usr/bin/python3
+    #   执行 `-m sglang.launch_server` 会 ModuleNotFoundError。
+    #   优先用显式指定的 PD_PYTHON_BIN, 否则挑一个能 import sglang 的。
+    # ==========================================================
+    _resolve_python_bin() {
+      if [ -n "${PD_PYTHON_BIN:-}" ] && [ -x "${PD_PYTHON_BIN}" ]; then
+        printf '%s' "${PD_PYTHON_BIN}"; return 0
+      fi
+      local c
+      for c in /opt/conda/bin/python3 /opt/conda/bin/python /usr/bin/python3; do
+        if [ -x "$c" ] && "$c" -c 'import sglang' >/dev/null 2>&1; then
+          printf '%s' "$c"; return 0
+        fi
+      done
+      # 都不行时给出最可能的路径, 让报错明确指向解释器而不是"模块不存在"
+      printf '%s' "${PD_PYTHON_BIN:-/opt/conda/bin/python3}"
+    }
+    PYTHON_BIN="$(_resolve_python_bin)"
+    log "python 解释器: ${PYTHON_BIN}"
+
+    # ==========================================================
+    # 1. 拓扑解析 (两种模式共用)
+    # ==========================================================
+    NODE_RANK="${LWS_WORKER_INDEX:-0}"
+    NNODES="${LWS_GROUP_SIZE:-1}"
+    # 注意: PD_LAUNCHER 在 set -u 下运行, 未注入时 LWS_LEADER_ADDRESS 不存在,
+    # 必须先给默认值再剥端口, 否则脚本会直接 unbound variable 退出。
+    LEADER_HOST="${LWS_LEADER_ADDRESS:-}"
+    LEADER_HOST="${LEADER_HOST%%:*}"
+
+    # ── master 地址解析 ──
+    # hostNetwork: true ⇒ podIP 就是宿主机 IP, --dist-init-addr 必须用这个真实 IP,
+    # 不能用 Service ClusterIP(那是虚拟 IP, 不符合 hostNetwork 语义)。
+    #
+    # 解析优先级:
+    #   1) PD_MASTER_IP 显式指定 (填宿主机 IP)
+    #   2) rank0 用自身 POD_IP
+    #   3) 其余 rank 通过 K8s API 查 leader(= <lws>-0) 的 podIP
+    #      —— 参考已验证的 StatefulSet 方案 (init 容器查 API 取 master IP)
+    #   4) 最后才回退 DNS (实测 NodeLocalDNS 下 headless A 记录不可靠)
+    _leader_pod_name() {
+      # LWS size=N, replicas=1: leader=<lws>-0, worker=<lws>-0-<i>
+      # POD_NAME 去掉尾部 -<NODE_RANK> 即 leader 名
+      if [ "${NODE_RANK}" = "0" ]; then printf '%s' "${POD_NAME:-}"; return 0; fi
+      [ -n "${POD_NAME:-}" ] || return 0
+      printf '%s' "${POD_NAME%-${NODE_RANK}}"
+    }
+
+    _api_get_pod_ip() {
+      local pod="$1" ns token
+      [ -n "${pod}" ] || return 0
+      ns="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo metax-ai-pd)"
+      token="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || true)"
+      [ -n "${token}" ] || return 0
+      # ⚠ 0.5.13-maca 镜像**不带 curl** (rc3 镜像有) → 用 python3 + urllib (stdlib)
+      "${PYTHON_BIN:-python3}" - "${pod}" "${ns}" "${token}" <<'PY' 2>/dev/null || true
+    import json, os, ssl, sys, urllib.request
+    pod, ns, token = sys.argv[1], sys.argv[2], sys.argv[3]
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "10.233.0.1")
+    port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+    url = "https://%s:%s/api/v1/namespaces/%s/pods/%s" % (host, port, ns, pod)
+    ctx = ssl.create_default_context(cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            print(json.load(r).get("status", {}).get("podIP") or "")
+    except Exception:
+        pass
+    PY
+    }
+
+    MASTER_IP=""
+    if [ -n "${PD_MASTER_IP:-}" ]; then
+      MASTER_IP="${PD_MASTER_IP}"
+      log "master 来源: PD_MASTER_IP(显式) = ${MASTER_IP}"
+    fi
+
+    if [ -z "${MASTER_IP}" ] && [ "${NODE_RANK}" = "0" ]; then
+      MASTER_IP="${POD_IP:-}"
+      [ -n "${MASTER_IP}" ] && log "master 来源: rank0 自身 POD_IP = ${MASTER_IP}"
+    fi
+
+    if [ -z "${MASTER_IP}" ]; then
+      _leader="$(_leader_pod_name)"
+      _leader_ip=""
+      for _try in 1 2 3 4 5 6 7 8 9 10; do
+        _leader_ip="$(_api_get_pod_ip "${_leader}")"
+        [ -n "${_leader_ip}" ] && break
+        log "等待 leader pod '${_leader}' 的 podIP... (${_try}/10)"
+        sleep 3
+      done
+      if [ -n "${_leader_ip}" ]; then
+        MASTER_IP="${_leader_ip}"
+        log "master 来源: K8s API leader '${_leader}' -> ${MASTER_IP}"
+      fi
+    fi
+
+    if [ -z "${MASTER_IP}" ] && [ -n "${LEADER_HOST}" ]; then
+      _all_ips="$(getent hosts "${LEADER_HOST}" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
+      [ -n "${_all_ips}" ] && warn "回退 DNS '${LEADER_HOST}' -> ${_all_ips} (可能不准确)"
+      MASTER_IP="$(echo "${_all_ips}" | awk '{print $1}')"
+    fi
+
+    if [ -z "${MASTER_IP}" ]; then
+      # 安全阀: rank != 0 若各自回退 POD_IP, 4 个节点会各自成为 master,
+      # 分布式初始化静默分裂 —— 宁可失败也不带病启动。
+      die "无法确定 master 地址 (rank=${NODE_RANK}, leader='${LEADER_HOST:-<空>}'); 请设置 PD_MASTER_IP 为 leader 所在宿主机的 IP"
+    fi
+
+    DIST_INIT_PORT="${PD_DIST_INIT_PORT:-5000}"
+    DIST_ADDR="${MASTER_IP}:${DIST_INIT_PORT}"
+
+    # ==========================================================
+    # 2. 分派
+    # ==========================================================
+    launch_explicit() {
+      [ -n "${PD_MODEL_PATH:-}" ] || die "explicit 模式需要 PD_MODEL_PATH"
+      if [ ! -d "${PD_MODEL_PATH}" ]; then
+        warn "模型目录不存在: ${PD_MODEL_PATH} (hostPath 挂载 / 模型分发是否就绪?)"
+      fi
+
+      # ── 网卡名自适应 (对齐厂商 get_net_primary_iface) ──
+      # 厂商 common.sh 用 `ip route get 8.8.8.8` 取**默认路由出口网卡**作为
+      # GLOO/NCCL/MCCL/NVSHMEM 的 ifname; official 模式因此天然跟着节点走。
+      # 本集群节点不一致: 多数节点管理网卡是 manage0, 但 mxgpu-3-28 的 IP 在 br-lan 上、
+      # manage0 **没有地址** → explicit 模式写死 manage0 会让 Gloo 直接报
+      #   RuntimeError: ... Unable to find address for: manage0
+      # (发生在 ModelRunner.init_torch_distributed, 整个 scheduler 全灭)
+      #
+      # ⚠ 0.5.13-maca 镜像**不含 iproute2** (`ip` 不存在, rc3 镜像有) —— 故:
+      #   有 ip 时用 `ip route get`; 否则读 /proc/net/route 里 Destination=00000000 的行。
+      # 注意所有命令都带 `|| true`: 本脚本是 set -euo pipefail, 命令替换里的
+      # 管道返回非 0 会**静默**杀掉整个脚本 (实测踩过, 日志里一行错误都没有)。
+      _net_primary_iface() {
+        local i=""
+        if command -v ip >/dev/null 2>&1; then
+          i="$( { ip route get 8.8.8.8 2>/dev/null | grep -oP '(?<=dev )\S+' | head -1; } || true)"
+        fi
+        [ -n "${i}" ] || i="$( { awk '$2=="00000000" {print $1; exit}' /proc/net/route 2>/dev/null; } || true)"
+        printf '%s' "${i}"
+      }
+
+      # PD_SOCKET_IFNAME=auto (默认/留空) → 按默认路由探测; 显式给值则不探测。
+      local _iface="${PD_SOCKET_IFNAME:-auto}"
+      if [ "${_iface}" = "auto" ] || [ -z "${_iface}" ]; then
+        _iface="$(_net_primary_iface)"
+        [ -n "${_iface}" ] || die "无法探测默认路由网卡 (ip 与 /proc/net/route 都失败), 请显式设置 PD_SOCKET_IFNAME"
+        log "网卡自适应: PD_SOCKET_IFNAME=auto -> ${_iface}"
+      fi
+      export PD_SOCKET_IFNAME="${_iface}"
+      export GLOO_SOCKET_IFNAME="${_iface}"
+      export NCCL_SOCKET_IFNAME="${_iface}"
+      export MCCL_SOCKET_IFNAME="${_iface}"
+      export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME="${_iface}"
+      export MXSHMEM_BOOTSTRAP_UID_SOCK_IFNAME="${_iface}"
+
+      local ARGS=(
+        --model-path="${PD_MODEL_PATH}"
+        --trust-remote-code
+        --dtype="${PD_DTYPE:-auto}"
+        --quantization="${PD_QUANTIZATION:-w8a8_int8}"
+        --context-length="${PD_CONTEXT_LENGTH:-200000}"
+        --kv-cache-dtype="${PD_KV_CACHE_DTYPE:-bf16}"
+        --tp-size="${PD_TP_SIZE:-8}"
+        --pp-size="${PD_PP_SIZE:-1}"
+        --dp-size="${PD_DP_SIZE:-4}"
+        --disaggregation-mode="${PD_ROLE}"
+        --disaggregation-ib-device="${PD_DISAGG_IB_DEVICE:-mlx5_0,mlx5_1}"
+        --disaggregation-bootstrap-port="${PD_BOOTSTRAP_PORT:-8998}"
+        --dist-init-addr="${DIST_ADDR}"
+        --dist-timeout="${PD_DIST_TIMEOUT:-300}"
+        --nnodes="${NNODES}"
+        --node-rank="${NODE_RANK}"
+        --host="${PD_HOST:-0.0.0.0}"
+        --port="${PD_HTTP_PORT:-8000}"
+        --mem-fraction-static="${PD_MEM_FRACTION_STATIC:-0.85}"
+        --max-running-requests="${PD_MAX_RUNNING_REQUESTS:-64}"
+        --chunked-prefill-size="${PD_CHUNKED_PREFILL_SIZE:-8192}"
+        --load-balance-method="${PD_LOAD_BALANCE_METHOD:-round_robin}"
+        --disable-shared-experts-fusion
+        --swa-full-tokens-ratio="${PD_SWA_FULL_TOKENS_RATIO:-0.1}"
+        --reasoning-parser="${PD_REASONING_PARSER:-deepseek-v4}"
+        --tool-call-parser="${PD_TOOL_CALL_PARSER:-deepseekv4}"
+        --watchdog-timeout="${PD_WATCHDOG_TIMEOUT:-3600}"
+        --enable-metrics
+      )
+
+      # --- dp-attention: 仅 dp>1 时传 ---
+      # 对齐厂商 decode.sh: `[ "$decode_dp_size" -gt 1 ] && args+=("--enable-dp-attention")`;
+      # prefill 是 dp=1 (tp=4 × pp=8), 传了反而偏离厂商已验证路径。
+      if [ "${PD_DP_SIZE:-4}" -gt 1 ]; then
+        ARGS+=( --enable-dp-attention --enable-dp-lm-head )
+      fi
+
+      # --- EP / MoE 后端: 只有显式给了 PD_EP_SIZE / PD_MOE_A2A_BACKEND 才传 ---
+      # 对齐厂商: decode 走 ep=dp=tp=32 + deepep low_latency + deep_gemm;
+      #          prefill 不传任何 ep/moe/deepep 项 (厂商 prefill.sh 里没有)。
+      if [ -n "${PD_EP_SIZE:-}" ]; then
+        ARGS+=( --ep-size="${PD_EP_SIZE}" )
+      fi
+      # max-prefill-tokens 厂商两个脚本都没传, 故只有显式设了才传
+      if [ -n "${PD_MAX_PREFILL_TOKENS:-}" ]; then
+        ARGS+=( --max-prefill-tokens="${PD_MAX_PREFILL_TOKENS}" )
+      fi
+      # cuda-graph-max-bs: 仅 decode 需要 (厂商 decode=8); prefill 用
+      # --disable-cuda-graph, 传了也不生效, 故只有显式设了才传
+      if [ -n "${PD_CUDA_GRAPH_MAX_BS:-}" ]; then
+        ARGS+=( --cuda-graph-max-bs="${PD_CUDA_GRAPH_MAX_BS}" )
+      fi
+      if [ -n "${PD_MOE_A2A_BACKEND:-}" ]; then
+        ARGS+=(
+          --moe-a2a-backend="${PD_MOE_A2A_BACKEND}"
+          --moe-runner-backend="${PD_MOE_RUNNER_BACKEND:-deep_gemm}"
+          --moe-dense-tp-size="${PD_MOE_DENSE_TP_SIZE:-1}"
+        )
+        [ -n "${PD_DEEPEP_MODE:-}" ] && ARGS+=( --deepep-mode="${PD_DEEPEP_MODE}" )
+      fi
+
+      # --- EAGLE 投机解码 (decode 侧优化; prefill 默认关) ---
+      if [ "${PD_SPECULATIVE_ENABLE:-0}" = "1" ]; then
+        ARGS+=(
+          --speculative-algorithm="${PD_SPECULATIVE_ALGO:-EAGLE}"
+          --speculative-eagle-topk="${PD_SPECULATIVE_EAGLE_TOPK:-4}"
+          --speculative-num-draft-tokens="${PD_SPECULATIVE_NUM_DRAFT_TOKENS:-16}"
+          --speculative-num-steps="${PD_SPECULATIVE_NUM_STEPS:-3}"
+        )
+        # 厂商 decode.sh 传的是 --speculative-draft-model-path=<与 target 同一个目录>
+        # (MTP 头就在该模型目录内)。不传此项 sglang 会去别处找 draft 权重。
+        if [ -n "${PD_SPECULATIVE_DRAFT_MODEL_PATH:-}" ]; then
+          ARGS+=( --speculative-draft-model-path="${PD_SPECULATIVE_DRAFT_MODEL_PATH}" )
+        fi
+        log "EAGLE 已启用 (topk=${PD_SPECULATIVE_EAGLE_TOPK:-4} draft=${PD_SPECULATIVE_NUM_DRAFT_TOKENS:-16} steps=${PD_SPECULATIVE_NUM_STEPS:-3} draft_path=${PD_SPECULATIVE_DRAFT_MODEL_PATH:-<未指定>})"
+      fi
+
+      # --- ⚠ 未验证 flag ---
+      if [ "${PD_PREFILL_ROUND_ROBIN_BALANCE:-1}" = "1" ]; then
+        ARGS+=( --prefill-round-robin-balance )
+        warn "已加入 --prefill-round-robin-balance (未在 v0.5.8 验证); 报 unrecognized argument 请设 PD_PREFILL_ROUND_ROBIN_BALANCE=0"
+      fi
+
+      # --- EPLB 专家负载均衡 ---
+      # 注意两个 flag 语义不同 (实测踩过):
+      #   --enable-eplb            布尔开关, **不接受值**
+      #   --init-expert-location   接预计算 EPLB 文件路径
+      # 早期版本用 `grep --*eplb*` 自动探测, 会探到布尔开关 --enable-eplb 再拼上
+      # "=<file>", 直接报 "ignored explicit argument"。故改为显式区分。
+      if [ "${PD_EPLB_ENABLE:-0}" = "1" ]; then
+        ARGS+=( --enable-eplb )
+        EPLB_FILE="${PD_EPLB_FILE:-}"
+        if [ -n "${EPLB_FILE}" ]; then
+          if [ -f "${EPLB_FILE}" ] || [ "${PD_EPLB_TRUST_FILE:-0}" = "1" ]; then
+            ARGS+=( "--init-expert-location=${EPLB_FILE}" )
+            log "EPLB 已启用: --enable-eplb + --init-expert-location=${EPLB_FILE}"
+          else
+            warn "EPLB 文件不存在, 只开 --enable-eplb 不加载文件: ${EPLB_FILE}"
+          fi
+        else
+          log "EPLB 已启用: --enable-eplb (未指定文件, 让 sglang 自行统计)"
+        fi
+      fi
+
+      # --- 逃生舱 (故意不加引号: 需按空白拆成多个 argv) ---
+      if [ -n "${PD_EXTRA_ARGS:-}" ]; then
+        # shellcheck disable=SC2206
+        ARGS+=( ${PD_EXTRA_ARGS} )
+        log "已追加 PD_EXTRA_ARGS: ${PD_EXTRA_ARGS}"
+      fi
+
+      _print_summary "explicit"
+      _print_argv "${ARGS[@]}"
+
+      if [ -n "${PD_DRY_RUN:-}" ]; then
+        log "PD_DRY_RUN 已设置, 只打印不拉起引擎。"
+        exit 0
+      fi
+
+      cd "${PD_WORKDIR:-/workspace}"
+      exec "${PYTHON_BIN}" -m sglang.launch_server "${ARGS[@]}"
+    }
+
+    # ── 从镜像内官方脚本探测厂商实际使用的 EPLB flag 名 ──
+    # 注意 pipefail: grep 无匹配时整条管道返回非零, 必须 || true 兜底,
+    # 否则"镜像里没有 eplb 字样"会让启动器直接退出。
+    _discover_eplb_flag() {
+      local d="${LLM_LAUNCH_DIR:-/workspace/llm-launch}"
+      [ -d "${d}" ] || return 0
+      { grep -rhoE -- '--[A-Za-z0-9-]*eplb[A-Za-z0-9-]*' "${d}" 2>/dev/null || true; } \
+        | sort -u | head -1
+    }
+
+    # ── 安全读取配置值: 只 grep 提取, 绝不 source 厂商脚本 ──
+    # 同样必须容忍"变量不存在": 厂商 config.sh 的变量名随版本变化, 缺一个
+    # 不应导致启动失败, 只应回落到 <default>。
+    _extract_config_value() {
+      local var_name="$1" file="$2" out=""
+      [ -f "${file}" ] || return 0
+      out="$(grep -oE "(readonly[[:space:]]+)?${var_name}=\"?[^\"]+\"?" "${file}" 2>/dev/null \
+        | tail -1 || true)"
+      [ -z "${out}" ] && return 0
+      out="${out#*${var_name}=}"
+      out="${out#\"}"
+      out="${out%\"}"
+      printf '%s' "${out}"
+    }
+
+    # ── 幂等回写变量 (仅容器可写层) ──
+    _override_var() {
+      local var_name="$1" value="$2" file="$3"
+      [ -n "${value}" ] || return 0
+      [ -f "${file}" ] || { warn "回写跳过: ${file} 不存在 (变量 ${var_name})"; return 0; }
+      if grep -qE "^[[:space:]]*(readonly[[:space:]]+)?${var_name}=" "${file}"; then
+        sed -i -E "s|^([[:space:]]*(readonly[[:space:]]+)?${var_name}=).*|\1\"${value}\"|" "${file}"
+        log "变量回写: ${var_name} -> ${value}  [$(basename "${file}")]"
+      else
+        warn "回写跳过: $(basename "${file}") 中无 ${var_name}"
+      fi
+    }
+
+    _print_summary() {
+      log "============================================================"
+      log "DeepSeek-V4 (rc3-maca) PD Launcher — Startup Summary"
+      log "============================================================"
+      log "Mode            : $1"
+      log "Role            : ${PD_ROLE}"
+      log "Node Rank       : ${NODE_RANK} / ${NNODES}"
+      log "Master IP       : ${MASTER_IP}   (leader='${LEADER_HOST:-<n/a>}')"
+      log "Dist Init Addr  : ${DIST_ADDR}"
+      log "HTTP Endpoint   : http://${PD_HOST:-0.0.0.0}:${PD_HTTP_PORT:-8000}"
+      log "PD Bootstrap    : ${PD_BOOTSTRAP_PORT:-8998}"
+      log "============================================================"
+    }
+
+    _print_argv() {
+      log "Final argv:"
+      printf '[pd-launcher]  ' >&2
+      printf ' %q' "$@" >&2
+      printf '\n' >&2
+      log "============================================================"
+    }
+
+    # ==========================================================
+    # 3. official 模式 — 跑镜像内官方脚本 (GPUStack start_pd.sh 式适配层)
+    #    ① 清除 explicit 专用 env  ② env→厂商变量回写
+    #    ③ Port/Host/Bootstrap 覆盖  ④ 摘要(回写后有效值)  ⑤ exec
+    # ==========================================================
+
+    # ── 清掉 explicit 专用 env: 厂商脚本自己决定这些值 ──
+    # config.sh 会 export 网卡/架构变量, models/<spec>.sh 会 export DSv4 行为开关。
+    # 我们若继续带着 explicit 模式手工设的值, 就会覆盖厂商决定 —— 名为对齐、实为偏离。
+    # 注: 只清"会改变 sglang 行为"与"厂商明确重设"的变量; MACA_* 平台变量保留
+    #     (厂商用 export_multi_arch 同时导出 CUDA_/MACA_ 双名, 重复无害)。
+    # ⚠ CUDA_PATH 不在清单内 —— 厂商 config.sh:178 是
+    #       readonly cuda_home cuda_path_bak="$CUDA_PATH"
+    #   即"存下调用方的值, 换成本机 cuda_home, 再恢复" —— 它**读**这个变量,
+    #   不自己设置。清掉后厂商脚本在 set -u 下直接
+    #   `config.sh: line 178: CUDA_PATH: unbound variable` 退出 (实测: 容器 2s 内 exit 1,
+    #   hostNetwork 下日志只剩 common.sh 的 "$SHELL: $BASH_VERSION" 那行, 极易误诊)。
+    #   取值与官方 docker 指南一致 (pod env 里已有 CUDA_PATH=/opt/maca/tools/cu-bridge)。
+    # 若发现某个变量厂商脚本并未覆盖而实际需要, 从本清单移除即可。
+    _official_unset_explicit_envs() {
+      local v
+      for v in \
+        USE_INDEX_CACHE \
+        USE_SINGLE_STREAM_DISPATCH_OVERLAP SGLANG_DEEPEP_BF16_DISPATCH \
+        SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER MX_SGLANG_ENABLE_KV_LAYOUT_FIX \
+        GLOO_SOCKET_IFNAME NCCL_SOCKET_IFNAME MCCL_SOCKET_IFNAME \
+        NCCL_IB_HCA MCCL_IB_HCA \
+        NVSHMEM_HCA_LIST MXSHMEM_HCA_LIST \
+        NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME MXSHMEM_BOOTSTRAP_UID_SOCK_IFNAME \
+        NVSHMEM_DISABLE_CUDA_VMM MXSHMEM_DISABLE_MACA_VMM \
+        NVSHMEM_SYMMETRIC_SIZE MXSHMEM_SYMMETRIC_SIZE \
+        TORCH_CUDA_ARCH_LIST TORCH_MACA_ARCH_LIST TVM_FFI_CUDA_ARCH_LIST \
+        TRITON_ENABLE_ELEMENTWISE_PK_FMA_OPT \
+        PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM
+      do
+        if [ -n "$(printenv "$v" 2>/dev/null || true)" ]; then
+          unset "$v" || true
+        fi
+      done
+      log "official: 已清除 explicit 专用环境变量 (网卡/架构/DSv4 开关交由厂商脚本决定)"
+    }
+
+    # ── 显式置空某变量 (__override_var 遇空值直接 return, 这里需要写空串) ──
+    _clear_var() {
+      local var_name="$1" file="$2"
+      [ -f "${file}" ] || { warn "清空跳过: ${file} 不存在 (${var_name})"; return 0; }
+      if grep -qE "^[[:space:]]*(readonly[[:space:]]+)?${var_name}=" "${file}"; then
+        sed -i -E "s|^([[:space:]]*(readonly[[:space:]]+)?${var_name}=).*|\1\"\"|" "${file}"
+        log "回写 ${var_name} -> <空>  [$(basename "${file}")]"
+      else
+        warn "清空跳过: $(basename "${file}") 中无 ${var_name}"
+      fi
+    }
+
+    # ── 解锁官方便选项 (把注释掉的 argv 行取消注释, 如 --enable-metrics) ──
+    _uncomment_argv() {
+      local file="$1" token="$2"
+      [ -f "${file}" ] || { warn "解锁跳过: ${file} 不存在"; return 0; }
+      if grep -qE "^[[:space:]]*${token}([[:space:]]|$)" "${file}"; then
+        log "argv 已是启用状态: ${token}"
+      elif grep -qE "^[[:space:]]*#[[:space:]]*${token}([[:space:]]|$)" "${file}"; then
+        # 只去掉行首注释符, 保留行内其余参数 (token 不含逗号, 故用逗号作分隔符)
+        sed -i -E "s,^([[:space:]]*)#([[:space:]]*${token}),\1\2," "${file}"
+        log "解锁 argv: ${token} (厂商脚本中默认注释)"
+      else
+        warn "解锁跳过: $(basename "${file}") 中未找到 '${token}'"
+      fi
+    }
+
+    # ── 摘要: 打印厂商脚本里的有效值 (回写之后)。未回写的项会原样显示厂商公式 ──
+    _show_var() {
+      local var_name="$1" file="$2" val=""
+      [ -f "${file}" ] || return 0
+      val="$(grep -oE "^[[:space:]]*(readonly[[:space:]]+)?${var_name}=.*" "${file}" 2>/dev/null \
+        | tail -1 | sed -E "s|^[[:space:]]*(readonly[[:space:]]+)?${var_name}=||")"
+      [ -n "${val}" ] && printf '[pd-launcher]   %-40s: %s\n' "${var_name}" "${val}"
+      return 0
+    }
+
+    # ── env → 厂商变量回写 (只回写显式给出的项; 未给的保持厂商默认) ──
+    _official_write_back() {
+      local role="$PD_ROLE" cfg="$1" mdl="$2"
+
+      # 拓扑 PP/TP/EP/DP
+      # 厂商默认 (config.sh): decode  dp=ep=tp=nnodes×num_dies, pp=1
+      #                       prefill pp=prefill_pp_size_specific,
+      #                               tp=nnodes×num_dies/pp, dp=get_prefill_dp_size()
+      _override_var "${role}_tp_size" "${PD_TP_SIZE:-}" "${cfg}"
+      _override_var "${role}_dp_size" "${PD_DP_SIZE:-}" "${cfg}"
+      _override_var "${role}_pp_size" "${PD_PP_SIZE:-}" "${cfg}"
+      if [ "${role}" = "decode" ]; then
+        _override_var "decode_ep_size" "${PD_EP_SIZE:-}" "${cfg}"
+      fi
+
+      # 显存: 厂商是 get_*_mem_fraction_static(...) 查表, 表里没有本 GPU 会查空 →
+      # --mem-fraction-static="" 直接启动失败。该值还受 EAGLE draft worker 约束,
+      # 见 TROUBLESHOOTING §8, 换拓扑必须重标。
+      _override_var "${role}_mem_fraction_static" "${PD_MEM_FRACTION_STATIC:-}" "${cfg}"
+
+      # 上下文 / chunked prefill (定义在 models/<spec>.sh)
+      _override_var "context_length_specific"      "${PD_CONTEXT_LENGTH:-}"       "${mdl}"
+      _override_var "chunked_prefill_size_default" "${PD_CHUNKED_PREFILL_SIZE:-}" "${mdl}"
+
+      # 模型路径: 厂商模型脚本硬编码 /bgfs/models/... (本环境不存在) → 必须回写
+      _override_var "model_path_specific" "${PD_MODEL_PATH:-}" "${mdl}"
+
+      # 并发 (厂商原变量名; decode 侧是"每 DP rank"语义, 官方 decode.sh 会 ×dp)
+      _override_var "prefill_max_running_requests_pre_batch" \
+                    "${prefill_max_running_requests_pre_batch:-}" "${cfg}"
+      _override_var "decode_max_running_requests_specific" \
+                    "${decode_max_running_requests_specific:-}" "${mdl}"
+
+      if [ "${role}" = "decode" ]; then
+        # MTP/EAGLE: 厂商由此推导 --speculative-num-steps=draft-1 / topk=1
+        if [ "${PD_SPECULATIVE_ENABLE:-1}" = "0" ]; then
+          _override_var "decode_mtp_specific" "1" "${mdl}"
+          log "official: PD_SPECULATIVE_ENABLE=0 → decode_mtp_specific=1 (关 MTP)"
+        else
+          _override_var "decode_mtp_specific" "${PD_SPECULATIVE_NUM_DRAFT_TOKENS:-}" "${mdl}"
+        fi
+
+        # EPLB: 官方 decode.sh 仅当该变量非空才加
+        # --enable-eplb --init-expert-location=<file>。
+        # ⚠ 厂商 models/<spec>.sh 的默认值指向 /workspace/eplb/deepseek-v4/deepseek-v4.pt,
+        #   该路径在镜像内**不存在** → 不处理就会拉起时才发现。故:
+        #   文件存在才回写, 否则回写空值(=关闭 EPLB)并告警。
+        if [ "${PD_EPLB_ENABLE:-0}" = "1" ]; then
+          if [ -n "${PD_EPLB_FILE:-}" ] && [ -f "${PD_EPLB_FILE}" ]; then
+            _override_var "decode_eplb_file_specific" "${PD_EPLB_FILE}" "${mdl}"
+          else
+            warn "PD_EPLB_ENABLE=1 但 EPLB 文件不可用 (${PD_EPLB_FILE:-<未设置>}) → 关闭 EPLB"
+            _clear_var "decode_eplb_file_specific" "${mdl}"
+          fi
+        else
+          log "EPLB 未启用 (PD_EPLB_ENABLE=${PD_EPLB_ENABLE:-<未设置>}) → 回写空值;"
+          log "  厂商默认指向镜像内不存在的 /workspace/eplb/... , 要用请挂载文件并置 PD_EPLB_ENABLE=1"
+          _clear_var "decode_eplb_file_specific" "${mdl}"
+        fi
+      fi
+    }
+
+    launch_official() {
+      local launch_dir="${LLM_LAUNCH_DIR:-/workspace/llm-launch/sglang}"
+      local model_spec="${PD_MODEL_SPEC:-deepseek-v4-flash}"
+      local target="${launch_dir}/${PD_ROLE}.sh"
+      local config_file="${launch_dir}/config.sh"
+      local model_config="${launch_dir}/models/${model_spec}.sh"
+
+      [ -f "${target}" ] || die "官方脚本不存在: ${target} (镜像内 llm-launch 结构是否与文档一致?)"
+      [ -f "${config_file}" ] || die "官方 config.sh 不存在: ${config_file}"
+      [ -f "${model_config}" ] || warn "模型脚本不存在: ${model_config} (模型相关回写会跳过)"
+
+      # ① 拓扑解析已在共用段完成; 这里清掉 explicit 专用 env
+      _official_unset_explicit_envs
+
+      # ② env → 厂商变量回写
+      _official_write_back "${config_file}" "${model_config}"
+
+      # ③ 网卡 / disagg 设备 (厂商默认 mlx5_bond_*, 本环境是 mlx5_0/mlx5_1)
+      #    config.sh:157  --disaggregation-ib-device="$mooncake_ib_device"
+      _override_var "hca_list"           "${PD_HCA_LIST:-}"           "${config_file}"
+      _override_var "mooncake_ib_device" "${PD_MOONCAKE_IB_DEVICE:-}" "${config_file}"
+
+      # --- Port 覆盖 ---
+      if [ -z "${SKIP_PORT_OVERRIDE:-}" ]; then
+        local port_var="" port_val=""
+        case "${PD_ROLE}" in
+          prefill) port_var="prefill_server_port" ;;
+          decode)  port_var="decode_server_port" ;;
+        esac
+        port_val="${PD_HTTP_PORT:-}"
+        if [ -n "${port_val}" ]; then
+          _override_var "${port_var}" "${port_val}" "${config_file}"
+        else
+          log "Port 覆盖跳过: 未设置 PD_HTTP_PORT (将用厂商默认 9292/9293)"
+        fi
+      else
+        log "Port 覆盖已禁用 (SKIP_PORT_OVERRIDE)"
+      fi
+
+      # --- Host 强制 0.0.0.0 (hostNetwork 下健康检查必需) ---
+      if [ -z "${SKIP_HOST_OVERRIDE:-}" ]; then
+        # 兼容 4 种写法 (已在四种形式上验证):
+        #   --host=$local_ip / --host="$local_ip"
+        #   --host=\"$local_ip\" / --host="\$local_ip"
+        if grep -qE -- '--host=\\?"?\\?\$local_ip' "${config_file}"; then
+          sed -i -E 's|--host=\\?"?\\?\$local_ip\\?"?|--host=0.0.0.0|g' "${config_file}"
+          log "Host 覆盖: --host 强制为 0.0.0.0"
+        else
+          warn "Host 覆盖跳过: config.sh 中未匹配到 --host=\$local_ip"
+        fi
+      else
+        log "Host 覆盖已禁用 (SKIP_HOST_OVERRIDE)"
+      fi
+
+      # --- PD bootstrap 覆盖 (llm-d sidecar 按 sglang 默认 8998 查询) ---
+      if [ -z "${SKIP_BOOTSTRAP_OVERRIDE:-}" ]; then
+        local bs="${PD_BOOTSTRAP_PORT:-8998}"
+        if grep -qE -- '--disaggregation-bootstrap-port=[0-9]+' "${config_file}"; then
+          sed -i -E "s|--disaggregation-bootstrap-port=[0-9]+|--disaggregation-bootstrap-port=${bs}|g" "${config_file}"
+          log "Bootstrap 覆盖: --disaggregation-bootstrap-port=${bs}"
+        else
+          log "Bootstrap 覆盖跳过: 厂商脚本未显式设置 (sglang 默认即 8998)"
+        fi
+      else
+        log "Bootstrap 覆盖已禁用 (SKIP_BOOTSTRAP_OVERRIDE)"
+      fi
+
+      # --- 可选 argv 解锁 (厂商默认注释掉的项) ---
+      if [ "${PD_ENABLE_METRICS:-1}" = "1" ]; then
+        _uncomment_argv "${config_file}" "--enable-metrics"
+      fi
+
+      # --- 摘要 ---
+      _print_summary "official"
+      log "Model Spec      : ${model_spec}"
+      log "Target Script   : ${target}"
+      log "Final Call      : ${PD_ROLE}.sh ${model_spec} ${MASTER_IP} ${NNODES} ${NODE_RANK}"
+      log "--- 回写后的有效值 (读自补丁后的厂商脚本; 公式=未回写, 用厂商默认) ---"
+      _show_var "${PD_ROLE}_tp_size"         "${config_file}"
+      _show_var "${PD_ROLE}_dp_size"         "${config_file}"
+      [ "${PD_ROLE}" = "decode" ] && _show_var "decode_ep_size" "${config_file}"
+      _show_var "${PD_ROLE}_pp_size"         "${config_file}"
+      _show_var "${PD_ROLE}_mem_fraction_static" "${config_file}"
+      _show_var "hca_list"                   "${config_file}"
+      _show_var "mooncake_ib_device"         "${config_file}"
+      _show_var "${PD_ROLE}_server_port"     "${config_file}"
+      _show_var "context_length_specific"    "${model_config}"
+      _show_var "chunked_prefill_size_default" "${model_config}"
+      _show_var "model_path_specific"        "${model_config}"
+      if [ "${PD_ROLE}" = "decode" ]; then
+        _show_var "decode_max_running_requests_specific" "${model_config}"
+        _show_var "decode_mtp_specific"      "${model_config}"
+        _show_var "decode_eplb_file_specific" "${model_config}"
+      fi
+      log "============================================================"
+
+      if [ -n "${PD_DRY_RUN:-}" ]; then
+        log "PD_DRY_RUN 已设置, 只打印不拉起引擎 (回写已生效于容器可写层)。"
+        exit 0
+      fi
+
+      cd "${launch_dir}"
+      exec bash "${target}" "${model_spec}" "${MASTER_IP}" "${NNODES}" "${NODE_RANK}"
+    }
+
+    case "${PD_LAUNCH_MODE}" in
+      explicit) launch_explicit ;;
+      official) launch_official ;;
+    esac
