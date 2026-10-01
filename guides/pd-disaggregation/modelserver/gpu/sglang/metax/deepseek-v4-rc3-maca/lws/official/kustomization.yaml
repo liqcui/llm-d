@@ -1,0 +1,39 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ══════════════════════════════════════════════════════════════════════════
+# 变体: 官方默认参数 (沐曦厂商预定义, 2026-10-01)
+#
+# 部署:  kubectl apply -k <此目录>        (或 ./deploy.sh official)
+# 卸载:  kubectl delete -k <此目录>
+#
+# 与 optimal/ 的唯一差异 = decode.yaml / prefill.yaml 的 env 值:
+#   Decode : tp=32/dp=32/ep=32/pp=1 (attention_tp=1), mem 0.80,
+#            EAGLE draft=3 (厂商默认), EPLB 关, max-running 40×dp32=1280
+#   Prefill: tp=4/pp=8/dp=1, mem 0.80, chunked 4096, max-running 64
+# 实测基准 (2026-09-26, 与 optimal 同镜像同压测条件):
+#   Output 298 tok/s / TTFT 29.9s / TPOT 63.8ms (见 OPTIMIZATION.md)
+# ══════════════════════════════════════════════════════════════════════════
+
+namespace: metax-ai-pd
+
+resources:
+  # 两套变体共用的基座 (router/services/sa/launcher/rbac, 只维护一份)
+  - ../shared
+  # 本变体专属 (与 optimal/ 的差异全在这两个文件)
+  - decode.yaml
+  - prefill.yaml
+
+# 镜像集中覆盖: 换仓库/换 tag 只改这里
+images:
+  # 模型服务镜像 (0.5.12 引擎 + MACA 3.8.2.6 用户态, 与集群驱动匹配;
+  #   含 llm-launch 全套补丁 + EPLB 文件)。官方/最优两变体共用同一镜像,
+  #   对比实验只差参数不差镜像。
+  - name: REPLACE_MODEL_SERVER_IMAGE
+    newName: harbor.isuanova.com/metax/sglang
+    newTag: 0.5.12-maca.ai3.8.2.7-torch2.10-py312-ubuntu22.04-amd64-llm
+  - name: REPLACE_ROUTING_SIDECAR_IMAGE
+    # 离线环境: 侧车镜像来自集群内 registry (已由 llm-d-offline-files 导入,
+    #   节点 /etc/hosts 将 registry.cubestack.io 指向 10.66.3.237)。
+    newName: registry.cubestack.io:5000/llm-d/llm-d-router-disagg-sidecar
+    newTag: v0.9.0

@@ -117,8 +117,8 @@ spec:
               # ⚠ 因 dnsPolicy: ClusterFirst (hostNetwork 下集群 DNS 被忽略),
               #   LWS leader 域名解析不到, 此值**必须**能得到 leader 的**真实 host IP**。
               #
-              #   prefill 是 dp=1 (tp=4 × pp=8), 不走 sglang 的 dp-attention 端口握手,
-              #   因此填 ClusterIP 也能起 —— 但**不要**这么做: decode 侧同样写法会死锁
+              #   prefill 现为 dp=4 (tp=8 × dp=4), 与 decode 一样走 sglang 的
+              #   dp-attention 端口握手, 填 ClusterIP 同样会死锁 —— 因此**不要**填:
               #   (详见 decode.yaml 同名变量的注释), 两角色保持同一语义更安全。
               #
               # ✅ 留空 = 由 pd-launcher 按优先级解析:
@@ -129,16 +129,14 @@ spec:
                 value: ""
 
               # ── 启动模式 ──
-              # explicit = 本层显式拼装 sglang.launch_server argv (当前使用)
-              #   ⚠ 镜像 0.5.13-maca (MACA 3.8.1.3) **不带厂商 llm-launch 脚本**
-              #     (/workspace/llm-launch 不存在), 只能走 explicit。
-              #     下面取值是把厂商 0.5.8-rc3 prefill.sh 的**实测 argv 1:1 翻译**过来的。
-              #     prefill 与 decode 的差异 (照抄厂商): 有 --disable-cuda-graph /
-              #     --disable-radix-cache / --enable-dynamic-chunking, 但**没有**
-              #     ep-size / dp-attention / moe / deepep 相关项 (见 PD_EXTRA_ARGS)。
-              # official = 跑镜像内 /workspace/llm-launch/sglang/prefill.sh (仅旧镜像有)
+              # official = 跑镜像内 /workspace/llm-launch/sglang/prefill.sh (厂商原版
+              #   脚本, 2026-09-25 已由用户 copy 进 0.5.13-maca 镜像, md5 与 rc3 一致)。
+              #   拓扑/显存等经 launcher 的 env 回写覆盖厂商公式 (见 launcher-configmap
+              #   的 _official_write_back)。EPLB 文件 /workspace/eplb/deepseek-v4/deepseek-v4.pt
+              #   也已随镜像提供 (decode 侧启用)。
+              # explicit = 本层显式拼装 sglang.launch_server argv (逃生舱, 旧用)
               - name: PD_LAUNCH_MODE
-                value: "explicit"
+                value: "official"
 
               # ── explicit 专用: 厂商 prefill.sh 有、decode 没有的开关 ──
               #   prefill 不抓 CUDA graph (厂商注释: --disable-cuda-graph), 也是 node 36
@@ -147,22 +145,26 @@ spec:
                 value: "--disable-cuda-graph --disable-radix-cache --enable-dynamic-chunking"
               - name: PD_SWA_FULL_TOKENS_RATIO
                 value: "0.2"                      # 厂商 prefill 0.2 (decode 是 0.4)
-              - name: PD_MAX_RUNNING_REQUESTS
-                value: "64"                       # 厂商 prefill_max_running_requests_pre_batch × dp(1)
+              # official 模式: 并发用厂商 prefill_max_running_requests_pre_batch(64),
+              #   decode.sh/prefill.sh 官方脚本自行 ×dp (64×dp4=256, 与 explicit 终值一致)。
+              #   (explicit 模式才需要 PD_MAX_RUNNING_REQUESTS 填乘完的终值)
               - name: PD_DIST_TIMEOUT
                 value: "300"                      # 厂商 prefill.sh --dist-timeout=300
 
-              # ── 拓扑 (explicit 直接作为 --tp/--pp/--dp-size 传; decode 另传 ep) ──
-              # 厂商默认 (config.sh): pp=models/<spec>.sh 的 prefill_pp_size_specific(8)
-              #                       tp=nnodes×num_dies/pp = 4×8/8 = 4
-              #                       dp=get_prefill_dp_size() = 1
-              # 下面写死的就是厂商默认值。
+              # ── 拓扑 (explicit 直接作为 --tp/--pp/--dp-size 传; ep 另传) ──
+              # 目标拓扑 (与头部注释 / kustomization 一致): 4 节点各 1 个 DP replica,
+              #   tp=8 (单节点内 8 卡) × dp=4 (4 节点) = 32 卡, pp=1 (推理禁用 PP),
+              #   ep=8 与 tp 对齐 (Expert 分布必须与 TP 匹配, MoE 路由才正确)。
+              # ⚠ 2026-09-26 对比实验已回滚: 厂商默认 (pp=8/tp=4/dp=1) 实测
+              #   TTFT 29.9s vs 优化拓扑 0.82s (36x), 详见 OPTIMIZATION.md。
               - name: PD_TP_SIZE
-                value: "4"
-              - name: PD_PP_SIZE
                 value: "8"
-              - name: PD_DP_SIZE
+              - name: PD_PP_SIZE
                 value: "1"
+              - name: PD_DP_SIZE
+                value: "4"
+              - name: PD_EP_SIZE
+                value: "8"
 
               # ── 显存 / 上下文 / chunk: 回写 config.sh + models/<spec>.sh ──
               # 厂商 prefill 侧 mem fraction 是硬编码函数, 恒为 0.82
@@ -170,8 +172,10 @@ spec:
                 value: "0.82"
               - name: PD_CONTEXT_LENGTH
                 value: "131072"                   # 厂商 context_length_specific = 1024×128
+              # ⚠ 2026-09-26 实验 A 结论: 8192 (×dp4=32768) TTFT 1.2s→15.4s 暴增,
+              #   大 chunk 反而让 prefill 调度变差 → 保持厂商默认 4096 (×dp4=16384)。
               - name: PD_CHUNKED_PREFILL_SIZE
-                value: "4096"                     # 厂商 chunked_prefill_size_default
+                value: "4096"                     # 厂商默认, 实验确认最优
 
               # ── 网卡 / disagg 设备 (厂商默认 mlx5_bond_*, 本环境不同, 必须回写) ──
               #   hca_list          → NCCL_IB_HCA / NVSHMEM_HCA_LIST

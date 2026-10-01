@@ -1,0 +1,61 @@
+# ══════════════════════════════════════════════════════════════════════════
+# PD 分离压测客户端 (bench_serving)
+#
+# 镜像: harbor.isuanova.com/metax/sglang:benchmark
+#   - 内置 sglang + ShareGPT 数据集 (/workspace/ShareGPT_V3_unfiltered_cleaned_split.json)
+#   - 离线环境必须用 --dataset-path 指向本地文件, 不能下载 HF 数据集
+# 模型: hostPath 挂载宿主机 /data/DeepSeek-V4-Flash-FlexSMQ-AWQ-W8A8
+#       (全部候选节点都有该目录, 故不固定节点; 无 GPU 需求)
+#
+# 创建: kubectl apply -f bench-client.yaml   (deploy.sh 会在 apply 后自动创建)
+# 删除: kubectl delete pod pd-bench-client
+#
+# 用法 (在 pod 内执行, 或 kubectl exec):
+#   kubectl -n metax-ai-pd exec pd-bench-client -- bash -c '
+#     /opt/conda/bin/python3 -m sglang.bench_serving --backend sglang \
+#       --base-url http://<router-ip>:8001 \
+#       --model /workspace/data/DeepSeek-V4-Flash-FlexSMQ-AWQ-W8A8 \
+#       --tokenizer /workspace/data/DeepSeek-V4-Flash-FlexSMQ-AWQ-W8A8 \
+#       --dataset-name sharegpt \
+#       --dataset-path /workspace/ShareGPT_V3_unfiltered_cleaned_split.json \
+#       --sharegpt-context-len 512 --sharegpt-output-len 128 \
+#       --num-prompts 100 --request-rate 20'
+#   ⚠ 首轮压测偏低是 TileLang JIT 热身 → 连续 2-3 轮取稳定值
+# ══════════════════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pd-bench-client
+  namespace: metax-ai-pd
+  labels:
+    llm-d.ai/guide: pd-disaggregation
+    llm-d.ai/role: bench
+spec:
+  restartPolicy: Never
+  containers:
+    - name: bench
+      image: harbor.isuanova.com/metax/sglang:benchmark
+      imagePullPolicy: IfNotPresent
+      # 常驻等待 exec 压测; 不用 kubelet 探活
+      command: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "8"
+          memory: 16Gi
+        limits:
+          cpu: "16"
+          memory: 32Gi
+      volumeMounts:
+        # ⚠ 与 modelserver 挂载约定一致: 宿主机 /data → 容器 /workspace/data,
+        #   模型路径 = /workspace/data/DeepSeek-V4-Flash-FlexSMQ-AWQ-W8A8
+        #   (挂错层级会导致 --model/--tokenizer 路径不存在 → transformers 走
+        #    hub 校验报 HFValidationError, 2026-10-01 踩过)
+        - name: model
+          mountPath: /workspace/data
+        # 数据集已在镜像内 /workspace/ShareGPT_V3_unfiltered_cleaned_split.json,
+        # 无需额外挂载 (若镜像更新后缺失, 可另行挂载)
+  volumes:
+    - name: model
+      hostPath:
+        path: /data
+        type: Directory

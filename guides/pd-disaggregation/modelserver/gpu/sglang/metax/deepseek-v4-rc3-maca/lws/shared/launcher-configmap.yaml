@@ -316,14 +316,15 @@ data:
 
       # --- dp-attention: 仅 dp>1 时传 ---
       # 对齐厂商 decode.sh: `[ "$decode_dp_size" -gt 1 ] && args+=("--enable-dp-attention")`;
-      # prefill 是 dp=1 (tp=4 × pp=8), 传了反而偏离厂商已验证路径。
+      # prefill 现为 dp=4, 同样走 dp-attention (与 decode 一致)。
       if [ "${PD_DP_SIZE:-4}" -gt 1 ]; then
         ARGS+=( --enable-dp-attention --enable-dp-lm-head )
       fi
 
       # --- EP / MoE 后端: 只有显式给了 PD_EP_SIZE / PD_MOE_A2A_BACKEND 才传 ---
       # 对齐厂商: decode 走 ep=dp=tp=32 + deepep low_latency + deep_gemm;
-      #          prefill 不传任何 ep/moe/deepep 项 (厂商 prefill.sh 里没有)。
+      # 现改为 ep=8 (与 tp 对齐), prefill 也显式给 ep=8 (EP 仅解码 MoE 路由需要),
+      # moe/deepep 后端项仍只有 decode 传。
       if [ -n "${PD_EP_SIZE:-}" ]; then
         ARGS+=( --ep-size="${PD_EP_SIZE}" )
       fi
@@ -540,8 +541,10 @@ data:
     _show_var() {
       local var_name="$1" file="$2" val=""
       [ -f "${file}" ] || return 0
+      # ⚠ || true: 不同血统的厂商脚本变量名可能不存在 (如 0.5.12 无 context_length_specific),
+      #   set -euo pipefail 下 grep 无匹配会让 launcher 静默死亡 (2026-09-26 踩过)。
       val="$(grep -oE "^[[:space:]]*(readonly[[:space:]]+)?${var_name}=.*" "${file}" 2>/dev/null \
-        | tail -1 | sed -E "s|^[[:space:]]*(readonly[[:space:]]+)?${var_name}=||")"
+        | tail -1 | sed -E "s|^[[:space:]]*(readonly[[:space:]]+)?${var_name}=||" || true)"
       [ -n "${val}" ] && printf '[pd-launcher]   %-40s: %s\n' "${var_name}" "${val}"
       return 0
     }

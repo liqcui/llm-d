@@ -139,7 +139,7 @@ spec:
               #   LWS leader 域名解析不到, 此值**必须**能得到 leader 的**真实 host IP**。
               #
               # ⛔ 不要填 services.yaml 里 decode-dist-master 的 ClusterIP:
-              #   decode 开了 --enable-dp-attention (dp=32), sglang 会从
+              #   decode 开了 --enable-dp-attention (dp=4), sglang 会从
               #   --dist-init-addr 推导一个 **ZMQ 握手端点** tcp://<host>:<port+13>
               #   (DP_ATTENTION_HANDSHAKE_PORT_DELTA=13, data_parallel_controller.py:308),
               #   node0 在该地址 bind 一个 REP socket, 其余 3 个节点**直连 node0** 握手。
@@ -148,8 +148,8 @@ spec:
               #   IPVS 也没有该端口的 service 规则。后果: node0 永久阻塞在
               #   _broadcast_ports_as_server, 其余节点 600s 后超时退出 →
               #   RecreateGroupOnPodRestart 整组重建 → 无限循环 (实测 decode 永远 1/2)。
-              #   (prefill 是 dp=1, 不走 dp-attention 握手, 所以填 ClusterIP 也能起 ——
-              #    但两角色统一留空, 避免这种"能起但语义错"的坑。)
+              #   (prefill 现为 dp=4, 同样走 dp-attention 握手 —— 但两角色统一留空,
+              #    避免这种"能起但语义错"的坑。)
               #
               # ✅ 留空 = 由 pd-launcher 按优先级解析:
               #   rank0 用自身 POD_IP; 其余 rank 通过 K8s API 查 leader(<lws>-0) 的 podIP
@@ -159,26 +159,27 @@ spec:
                 value: ""
 
               # ── 启动模式 ──
-              # explicit = 本层显式拼装 sglang.launch_server argv (当前使用)
-              #   ⚠ 镜像 0.5.13-maca (MACA 3.8.1.3) **不带厂商 llm-launch 脚本**
-              #     (/workspace/llm-launch 不存在), 只能走 explicit。
-              #     下面的取值是把厂商 0.5.8-rc3 decode.sh 的**实测 argv 1:1 翻译**过来的
-              #     (模型与拓扑都没变, 只是换镜像/换启动方式)。
-              #     ⚠ 厂商脚本里做了 dp_size 乘法的项, 这里要填**乘完的结果**:
-              #       chunked-prefill-size = 4096 × dp(32) = 131072
-              #       max-running-requests  =    8 × dp(32) = 256
-              # official = 跑镜像内 /workspace/llm-launch/sglang/decode.sh (仅旧镜像有)
+              # official = 跑镜像内 /workspace/llm-launch/sglang/decode.sh (厂商原版
+              #   脚本, 2026-09-25 已由用户 copy 进 0.5.13-maca 镜像, md5 与 rc3 一致)。
+              #   拓扑/显存/MTP/EPLB 经 launcher env 回写覆盖厂商公式。
+              #   ⚠ official 模式下厂商脚本自己 ×dp: chunked_prefill_size_default /
+              #     decode_max_running_requests_specific 都填**基础值** (4096 / 8),
+              #     不能填 explicit 模式那种乘完的终值。
+              # explicit = 本层显式拼装 sglang.launch_server argv (逃生舱, 旧用)
               - name: PD_LAUNCH_MODE
-                value: "explicit"
+                value: "official"
 
-              # ── explicit: EAGLE 投机解码 (厂商 decode.sh 实测值) ──
-              #   --speculative-algorithm=EAGLE --speculative-draft-model-path=<target 同目录>
-              #   --speculative-eagle-topk=1 --speculative-num-draft-tokens=4 --speculative-num-steps=3
-              #   (厂商 decode_mtp_specific=4 → steps=draft-1=3, topk 固定 1)
+              # ── EAGLE 投机解码 ──
+              # ⚠ 官方预定义 (2026-10-01 对比实验): 不设 decode_mtp_specific env。
+              #   0.5.12 血统: models 的 decode_mtp_default="${decode_mtp_specific:-3}"
+              #   读**环境变量** (launcher 回写到 models 文件无效, 文件里无定义行),
+              #   故缺省即厂商默认 = 3 → decode.sh 推 --speculative-num-steps=2
+              #   --speculative-eagle-topk=1 --speculative-num-draft-tokens=3 --speculative-algo=EAGLE
+              #   (v0.5.12 分支不加 --speculative-draft-model-path, draft 权重同目录自动发现)。
               - name: PD_SPECULATIVE_ENABLE
-                value: "0"   # ⚠ 临时: 基础镜像 0.5.13-maca 的 EAGLE draft 抓图崩溃, 见下方注释
+                value: "1"
               - name: PD_SPECULATIVE_NUM_DRAFT_TOKENS
-                value: "4"                        # → steps=3
+                value: "4"                        # explicit 模式用; official 模式由 decode_mtp_specific env 决定
               - name: PD_SPECULATIVE_EAGLE_TOPK
                 value: "1"
               - name: PD_SPECULATIVE_NUM_STEPS
@@ -197,9 +198,11 @@ spec:
                 value: "low_latency"
 
               # ── 拓扑: 回写 config.sh 的 decode_{tp,dp,ep,pp}_size ──
-              # 厂商默认 (config.sh): dp=ep=tp=nnodes×num_dies = 4×8 = 32, pp=1
-              # 即 attention_tp=1 (每卡一个 attention/DP rank) —— 厂商已验证的形态。
-              # 下面写死的就是厂商默认值, 要调只改这里 (official 模式会覆盖厂商公式)。
+              # ⚠ 官方预定义 (2026-10-01 对比实验): 厂商公式 dp=ep=tp=nnodes×num_dies
+              #   = 4×8 = 32 (即 attention_tp=1, 每卡一个 attention/DP rank), pp=1。
+              #   与 config.sh 公式结果一致, 显式写出便于审计。
+              #   对比: 优化拓扑 tp=8/ep=8/dp=4/pp=1 实测 1238 tok/s vs 厂商默认
+              #   298 tok/s (4.1x), 详见 OPTIMIZATION.md。
               - name: PD_TP_SIZE
                 value: "32"
               - name: PD_DP_SIZE
@@ -210,39 +213,42 @@ spec:
                 value: "1"
 
               # ── 显存 / 上下文 / chunk: 回写 config.sh + models/<spec>.sh ──
-              # ⚠ 厂商是 get_decode_mem_fraction_static(gpu, dp, mtp) 查表, 表里
-              #   (c550/mars-x201) 没有本 GPU → 查空会传 --mem-fraction-static="" 直接
-              #   启动失败, 因此必须回写。该值有两个硬约束, 换 dp/mtp 档位必须重新标定:
-              #   ① EAGLE draft worker: draft init 时可用显存 > draft 权重 / f  (§8)
-              #   ② graph 捕获余量: 32 个 DP rank 同时抓 CUDA graph, 每个 rank 还要在
-              #      f 之外再要几 GB; 余量不足时 MACA runtime 直接报
-              #      `mcErrorIllegalAddress` / `invalid_xvm_pde`, 栈落在
-              #      cuda_graph_runner.capture_one_batch_size, 报错极具误导性 (§13)
-              #   实测: dp=4 时 0.82 差 42 MB 就 raise, 0.78 才够;
-              #         dp=32 时 0.82 抓图期只剩 4.5 GB → 必崩, 故取 0.75。
+              # ⚠ 官方预定义 (2026-10-01): 本镜像 (0.5.12-maca...-llm) 的
+              #   get_decode_mem_fraction_static() 表已含 metax-c500 行:
+              #   dp=32/mtp=3 → **0.80** (表注"未实测", 2026-09-26 对比实验用 0.8
+              #   实测 298 tok/s 成功 100/100)。显式回写与查表结果一致, 避免
+              #   gpu_name 探测差异导致查空 → --mem-fraction-static="" 启动失败。
+              #   ⚠ 硬约束 (换 dp/mtp 必须重标): EAGLE draft worker 显存门槛 +
+              #   32 个 DP rank 同时抓 CUDA graph 的余量 (0.82 时只剩 4.5 GB 必崩)。
               - name: PD_MEM_FRACTION_STATIC
-                value: "0.75"                     # ⚠ 实测值: 0.82 在 dp=32 下 graph 捕获期崩溃, 见 §5.2 / TROUBLESHOOTING §13
+                value: "0.80"
+              # ⚠ 0.5.12 models 文件无 context_length_specific 定义行 → 回写是
+              #   no-op; 实际生效 = config.sh 缺省 ${context_length_specific:-132096}
+              #   (1024×129)。此 env 保留仅作文档 (两套配置同值, 不影响对比)。
               - name: PD_CONTEXT_LENGTH
-                value: "131072"                   # 厂商 context_length_specific = 1024×128
-              # ⚠ 厂商脚本里是 chunked_prefill_size_default(4096) × dp_size(32);
-              #   explicit 模式要填**乘完后的终值**
-              - name: PD_CHUNKED_PREFILL_SIZE
                 value: "131072"
-              # 厂商 decode_max_running_requests_specific(8) × dp_size(32) = 256
-              - name: PD_MAX_RUNNING_REQUESTS
-                value: "256"
+              # ⚠ official 模式: 填**基础值** 4096, 厂商 decode.sh 自行 ×dp_size(32)
+              #   (=131072 终值, 与厂商公式 chunked_prefill_size_default×dp 一致)。
+              - name: PD_CHUNKED_PREFILL_SIZE
+                value: "4096"
+              # official 模式: 并发不设 → 厂商默认 decode_max_running_requests
+              #   = models 的 decode_max_running_requests_default=40 (每 DP rank),
+              #   官方脚本自行 ×dp (40×32=1280 总并发; cuda-graph-max-bs 同样 1280)。
+              #   (explicit 模式才需要 PD_MAX_RUNNING_REQUESTS 填乘完的终值)
               # 厂商 decode.sh 实测值 (prefill 侧是 0.2, 两角色不同)
               - name: PD_SWA_FULL_TOKENS_RATIO
-                value: "0.4"
+                value: "0.4"    # explicit 专用; official 由 decode_model_args 给 0.1
               # 厂商 decode.sh: --cuda-graph-bs 1..8 --cuda-graph-max-bs=8
               - name: PD_CUDA_GRAPH_MAX_BS
-                value: "8"
+                value: "8"      # explicit 专用; official 由 decode.sh 按 max-running 推导
 
               # ── EPLB ──
               # 厂商 decode.sh 仅当 decode_eplb_file_specific 非空才加
-              # --enable-eplb --init-expert-location=<file>; 其默认值指向
-              # /workspace/eplb/deepseek-v4/deepseek-v4.pt, 该文件在镜像内不存在。
-              # 本层: 文件可挂载且 PD_EPLB_ENABLE=1 才回写, 否则回写空值=关闭并告警。
+              # --enable-eplb --init-expert-location=<file>; 本镜像 models 文件默认
+              # decode_eplb_file_specific="" → **厂商默认 EPLB 关** (文件虽在镜像内
+              # /workspace/eplb/deepseek-v4/deepseek-v4.pt 但默认值为空)。
+              # ⚠ 官方预定义 (2026-10-01): 保持 0 = 官方默认。
+              #   对比: 优化配置置 1 (实测 +6% 吞吐)。
               - name: PD_EPLB_ENABLE
                 value: "0"
               - name: PD_EPLB_FILE

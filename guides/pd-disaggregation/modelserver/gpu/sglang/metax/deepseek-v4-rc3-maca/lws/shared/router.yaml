@@ -46,7 +46,7 @@ spec:
                     values: ["true"]
       containers:
         - name: router
-          image: REPLACE_MODEL_SERVER_IMAGE
+          image: harbor.isuanova.com/metax/sglang:v0.5.12-glm5-rc4-pd
           imagePullPolicy: Always
           workingDir: /workspace
           command:
@@ -93,17 +93,19 @@ spec:
                 --request-timeout-secs 18000 --health-check-timeout-secs 90
           env:
             # 逗号分隔的 "<ip>:<port>" 列表。
-            # 取值为 services.yaml 的 *-dist-master **ClusterIP** (稳定指向 worker-index=0):
-            #   prefill → prefill-dist-master:8000   decode → decode-dist-master:8200
-            # ✅ 这里是**客户端**连接, 走 ClusterIP 没问题 (IPVS 单点转发)。
-            # ⛔ 同一对 ClusterIP 不要拿去填 PD_MASTER_IP: dp-attention 的 ZMQ 握手
-            #    要求直连 node0 的真实 IP, 填 ClusterIP 会死锁 (见 decode.yaml 注释)。
-            # ⚠ ClusterIP 首次创建时分配, 换集群/重建会变:
-            #   kubectl -n metax-ai-pd get svc prefill-dist-master decode-dist-master
+            # ⚠ 必须填 worker-index=0 (master) 的**宿主机 IP** (hostNetwork ⇒ podIP 即节点 IP):
+            #   prefill → prefill-dsv4rc3-0:<8000>   decode → decode-dsv4rc3-0:<8200>
+            #   ⛔ 不要填 *-dist-master 的 ClusterIP: PD 工作流要真实可达地址,
+            #      VIP 会让请求挂死 (症状: /health 200 但请求超时、日志只有 Step failed)。
+            # ⚠ leader 漂移 (整组重建后 worker-index=0 换节点) 需同步更新这两个 IP:
+            #   kubectl -n metax-ai-pd get pods -l 'llm-d.ai/guide=pd-disaggregation' -o wide
+            # 当前 (2026-10-01 官方变体): prefill master=10.66.3.31 (node 31),
+            #   decode master=10.66.3.33 (node 33)。leader 漂移后 deploy.sh 会自动同步
+            #   (本文件只作初始值; 手工改后需 scale 0→1 重启 router)。
             - name: PD_PREFILL_ENDPOINTS
-              value: "10.233.22.217:8000"
+              value: "10.66.3.31:8000"
             - name: PD_DECODE_ENDPOINTS
-              value: "10.233.63.143:8200"
+              value: "10.66.3.33:8200"
             - name: PD_BOOTSTRAP_PORT
               value: "8998"
             - name: PD_ROUTER_HTTP_PORT

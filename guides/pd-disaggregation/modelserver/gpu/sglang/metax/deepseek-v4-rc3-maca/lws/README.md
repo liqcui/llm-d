@@ -4,7 +4,8 @@
 > 与 GLM 方案（`metax/lws/`）、DeepSeek-V4-Flash 方案（`metax/deepseek-v4-flash/`）互不覆盖，
 > 三者使用**互斥的节点标签**，可在同一集群共存。
 
-**状态**（2026-09-24，新集群实测）：
+**状态**（2026-10-01：官方默认 vs 最优解同日对比完成，详见
+`BENCHMARK-COMPARISON-2026-10-01.md`；当前部署 = optimal 变体）：
 - ✅ **端到端已跑通**：prefill 4/4 + decode 4/4 Ready，EPP 已发现两端点，
   `Client → EPP → decode sidecar → prefill(KV) → decode` 返回正确结果（见 §7）。
 - ⚠ **镜像已换为 `0.5.13-maca`（MACA 3.8.1.3）**，起因是新集群驱动栈
@@ -30,9 +31,9 @@ Router 连通性矩阵见 `TROUBLESHOOTING.md` §10；验收清单（含实测�
 | 镜像 | `harbor.isuanova.com/metax/sglang:0.5.13-maca.ai3.8.1.3-torch2.10-py312-ubuntu22.04-amd64`（2026-09-24 由 rc3 镜像换为 0.5.13，见 §13） |
 | 启动模式 | `explicit`（标准 `sglang.launch_server` argv；该镜像无厂商脚本） |
 | 拓扑 | **每角色 1 个 4 节点逻辑实例**：LWS `replicas=1, size=4` → 4 pods / 4 节点 / 32 卡 |
-| 并行度 | `tp=8 dp=4 ep=8`（4 节点各 1 个 DP replica），`pp=1` |
+| 并行度 | 双变体: **官方默认** decode tp32/dp32/ep32 + prefill tp4/pp8/dp1 ／ **最优** tp8 dp4 ep8 + pp1 (见 §3) |
 | 网关 | **双网关**：llm-d EPP（规范入口）+ sglang router（对比入口），同一套 4P+4D 后端 |
-| 参数入口 | `base/prefill.yaml` / `base/decode.yaml` 的 `env:` 块（唯一入口） |
+| 参数入口 | `official/` 或 `optimal/` 的 `decode.yaml` / `prefill.yaml` 的 `env:` 块（唯一入口） |
 
 ## 2. 架构
 
@@ -66,16 +67,29 @@ Client ──┬─→ EPP ──────────→ decode pod routing-
 
 ```
 deepseek-v4-rc3-maca/lws/
-├── kustomization.yaml          # 部署入口 (namespace: metax-ai-pd; images: 集中覆盖镜像)
-├── README.md
-└── base/
-    ├── prefill.yaml            # LWS prefill-dsv4rc3: replicas=1 size=4
-    ├── decode.yaml             # LWS decode-dsv4rc3:  replicas=1 size=4 + routing-proxy sidecar
-    ├── router.yaml             # sglang router Deployment (对比网关)
-    ├── services.yaml           # prefill/decode headless (仅 worker-index=0)
-    ├── serviceAccount.yaml
-    └── launcher-configmap.yaml # 双模式启动器 (env → argv, 或调官方脚本)
+├── deploy.sh                   # 一键部署/切换: ./deploy.sh <official|optimal> [apply|delete]
+│                               #   apply 后自动等 pod Ready + 同步 router 端点 + 建压测 pod
+├── official/                   # ═ 变体 A: 沐曦官方默认参数 (独立 kustomize 目录) ═
+│   ├── kustomization.yaml      #   namespace + images + 资源清单 (共用 ../shared)
+│   ├── decode.yaml             #   官方默认: tp32/dp32/ep32/pp1, mem 0.80, EAGLE=3, EPLB 关
+│   └── prefill.yaml            #   官方默认: tp4/pp8/dp1, mem 0.80
+├── optimal/                    # ═ 变体 B: 最优解 (独立 kustomize 目录) ═
+│   ├── kustomization.yaml
+│   ├── decode.yaml             #   tp8/dp4/ep8/pp1, mem 0.75, EAGLE=5, EPLB 开
+│   └── prefill.yaml            #   tp8/dp4/pp1, mem 0.82
+├── shared/                     # 两变体共用 (只维护一份)
+│   ├── router.yaml             # sglang router Deployment (对比网关)
+│   ├── services.yaml           # prefill/decode headless (仅 worker-index=0)
+│   ├── serviceAccount.yaml
+│   ├── launcher-configmap.yaml # 双模式启动器 (env → argv, 或调官方脚本)
+│   └── rbac.yaml
+├── bench/
+│   └── bench-client.yaml       # 压测客户端 pod (metax/sglang:benchmark 镜像, 内置 ShareGPT)
+└── README.md
 ```
+
+**切换变体不需要改任何 yaml**: `./deploy.sh official` 或 `./deploy.sh optimal` 即可
+(两套差异全在 official/ 与 optimal/ 的 decode.yaml/prefill.yaml env 值; shared/ 只维护一份)。
 
 ## 4. 两种启动模式
 
@@ -193,10 +207,10 @@ official 模式下这些值经 §4 回写表写进厂商脚本；下表是本方
 
 | 变量 | prefill | decode | 说明 |
 |------|---------|--------|------|
-| `PD_TP_SIZE` / `PD_DP_SIZE` / `PD_EP_SIZE` / `PD_PP_SIZE` | 4 / 1 / — / 8 | 32 / 32 / 32 / 1 | 厂商公式 `nnodes×num_dies` 在 4 节点 ×8 卡下的结果（decode 即 attention_tp=1） |
-| `PD_MEM_FRACTION_STATIC` | 0.82（厂商 prefill 恒为 0.82） | 0.82 ⚠ 起手值 | **decode 侧是硬约束**，见 §5.2，部署后必须实测校准 |
+| `PD_TP_SIZE` / `PD_DP_SIZE` / `PD_EP_SIZE` / `PD_PP_SIZE` | 8 / 4 / 8 / 1 | 8 / 4 / 8 / 1 | 目标拓扑：4 节点各 1 个 DP replica（tp=8 单节点内 8 卡 × dp=4），ep 与 tp 对齐，pp=1（推理禁用 PP）。⚠ 厂商默认是 prefill 4/1/—/8、decode 32/32/32/1（attention_tp=1），已改写 |
+| `PD_MEM_FRACTION_STATIC` | 0.82（厂商 prefill 恒为 0.82） | 0.78 ⚠ dp=4 实测标定 | **decode 侧是硬约束**，见 §5.2；dp=4 时 0.82 差 42 MB 就 raise、0.78 才够，换 dp/mtp 必须重新标定 |
 | `PD_CONTEXT_LENGTH` | 131072 | 131072 | 厂商 `context_length_specific`（原先本项目用 200000） |
-| `PD_CHUNKED_PREFILL_SIZE` | 4096 | 4096 | 厂商 `chunked_prefill_size_default` |
+| `PD_CHUNKED_PREFILL_SIZE` | 4096 | 16384（=4096×dp4） | 厂商 `chunked_prefill_size_default`；decode 侧厂商脚本会 ×dp，explicit 填乘完的终值 |
 | `PD_SPECULATIVE_ENABLE` / draft tokens | — | 1 / 4 | 厂商 `decode_mtp_specific=4`（→ steps=3, topk=1）；prefill 不跑投机解码 |
 | `PD_HCA_LIST` / `PD_MOONCAKE_IB_DEVICE` | mlx5_0,mlx5_1 | 同左 | 厂商默认 `mlx5_bond_*`，本环境不适用 |
 | `PD_ENABLE_METRICS` | 1 | 1 | 厂商 `--enable-metrics` 是注释状态，本项目解锁以便 Prometheus 采集 |
@@ -216,9 +230,10 @@ dp=4 拓扑实测：f=0.82 时判据 2.90 GB、实测 2.86 GB → 启动即 `Run
 memory. Please try to increase --mem-fraction-static`（报错信息**误导**，调大只会更糟）。
 每降 0.01 可给 draft 多留 ~0.6 GB、门槛只抬高 ~0.035 GB，dp=4 时取 0.78 才留出余量。
 
-⚠ **本仓库当前切到的是厂商默认拓扑 dp=tp=ep=32（attention_tp=1），上面这组实测数字
-（对应 dp=4）不能直接沿用**：0.82 只是起手值，部署后必须按判据校准 —— 看启动日志里
-draft worker 的 `Load weight begin. avail mem=` 与 `Memory pool end. avail mem=`，
+⚠ 当前拓扑已回到 **dp=4（tp=8 × dp=4）**，上面这组实测数字（对应 dp=4）适用：
+decode 取 **0.78**。若日后切回 dp=32 档位，需按厂商默认 0.75 / 0.82 重新标定
+（见 base/decode.yaml 注释）。标定方法：看启动日志里 draft worker 的
+`Load weight begin. avail mem=` 与 `Memory pool end. avail mem=`，
 若 draft 阶段报 `Not enough memory` 就按 0.01 步长往下调。
 **换 GPU / 换 dp / 换 MTP 档位都要重新标定** —— 厂商 `get_decode_mem_fraction_static()`
 表按 `(gpu_name, dp_size, mtp)` 取值正是这个原因（且表里没有本 GPU 型号）。
@@ -244,7 +259,7 @@ draft worker 的 `Load weight begin. avail mem=` 与 `Memory pool end. avail mem
 
 | 变量 | 当前值 | 风险 |
 |------|--------|------|
-| `PD_MEM_FRACTION_STATIC`(decode) | 0.82 | 新拓扑（dp=32）下的起手值，**未实测**；按 §5.2 判据校准 |
+| `PD_MEM_FRACTION_STATIC`(decode) | 0.78 | dp=4 实测标定值（0.82 差 42 MB 就 raise、0.78 才够）；换 dp/mtp 必须按 §5.2 判据重新标定 |
 | `PD_EPLB_ENABLE` | 0 | 官方路径无 EPLB 文件可用；要用需先挂载 `/workspace/eplb/...` 并置 1 |
 | `PD_MASTER_IP` | 空（**保持空**） | 留空由 launcher 自动解析（rank0=POD_IP，rank1-3 查 K8s API 取 leader 真实 IP）。填值只用于排障，且**不能填 ClusterIP**（见 §5.1） |
 
@@ -269,22 +284,18 @@ kubectl label node <p1> <p2> <p3> <p4> metax-sglang-pd-prefill-dsv4rc3=true --ov
 kubectl label node <d1> <d2> <d3> <d4> metax-sglang-pd-decode-dsv4rc3=true  --overwrite
 kubectl label node <r1>                  metax-sglang-pd-router-dsv4rc3=true  --overwrite
 
-# 2) 先只建 Service, 拿 leader 稳定入口的 ClusterIP (对比网关用; 不用可跳过)
-kubectl -n metax-ai-pd apply -f .../deepseek-v4-rc3-maca/lws/base/services.yaml
-kubectl -n metax-ai-pd get svc prefill-dist-master decode-dist-master \
-  -o custom-columns=NAME:.metadata.name,IP:.spec.clusterIP
-#    → 回填 base/router.yaml 的 PD_PREFILL_ENDPOINTS(<ClusterIP>:8000) /
-#      PD_DECODE_ENDPOINTS(<ClusterIP>:8200)。不用对比网关时, 把 router.yaml
-#      从 base/kustomization.yaml 的 resources 里去掉即可。
-#    ⛔ 这两个 ClusterIP **只给客户端(router)用**, 不要填进 PD_MASTER_IP (见 §5.1)
+# 2) 部署 (官方默认变体; 最优解把 official 换成 optimal)
+cd guides/pd-disaggregation/modelserver/gpu/sglang/metax/deepseek-v4-rc3-maca/lws
+./deploy.sh official
+#   = kubectl apply -k official/ + 等待两组 pod Ready + 自动同步 router 端点
+#     (leader 漂移自动修复) + 自动创建压测 pod bench/bench-client.yaml
 
-# 3) (推荐) 先干跑: 把两个 LWS 的 PD_DRY_RUN 置 "1", 只打印 argv 不拉引擎
-# 4) 正式部署 (PD_MASTER_IP 保持空, 无需手工填任何 IP)
-kubectl apply -k guides/pd-disaggregation/modelserver/gpu/sglang/metax/deepseek-v4-rc3-maca/lws/
+# 3) 切换变体: 直接部署另一个即可 (LWS 整组重建, 旧组等待 ≥120s 释放端口)
+./deploy.sh optimal
 ```
 
-回滚：`kubectl delete -k .../lws/`。改动 LWS 拓扑需整组重建
-（`RecreateGroupOnPodRestart`），重建前建议等待 ≥120s 让旧连接释放。
+回滚：`./deploy.sh <official|optimal> delete`（= `kubectl delete -k <变体目录>`）。
+改动 LWS 拓扑需整组重建（`RecreateGroupOnPodRestart`），重建前建议等待 ≥120s 让旧连接释放。
 
 ## 7. 验收清单（含实测结果）
 
