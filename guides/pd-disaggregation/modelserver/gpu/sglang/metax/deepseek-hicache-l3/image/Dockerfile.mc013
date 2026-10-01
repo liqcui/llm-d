@@ -1,0 +1,122 @@
+# =============================================================================
+# 基于我们的 fix 版镜像 (r4-hicache-l2) 构建带新版 Mooncake (MACA) 的镜像
+# 目的:
+#   1. 新版 mooncake (源码最新, -DUSE_MACA=ON 官方 MetaX 支持)
+#      → mooncake_client (Dummy Client 模式 Real Client, 端口 50052)
+#      → mooncake.store.MooncakeHostMemAllocator (SGLang standalone_storage 钥匙)
+#   2. 引擎侧 mooncake python 包同步升级 (0.3.6.post1 → 最新, MACA 构建)
+#      风险: 引擎 PD 传输绑定的 API 变化 → 实测验证 (patch_mooncake_setup.py 已做
+#      _MC_SETUP_ACCEPTS_ENGINE 探测适配)
+# 构建指南: https://docs.kvcache.com.cn/Mooncake/getting_started/build.html
+#   (手动编译 + -DUSE_MACA=ON 段)
+# =============================================================================
+FROM harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    MACA_HOME=/opt/maca \
+    ASCEND_GITHUB_MIRROR_URLS=file:///tmp/mirror/
+
+# ── 1. 构建依赖 (官方 dependencies.sh 完整清单) ──
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    wget \
+    unzip \
+    libibverbs-dev \
+    libgoogle-glog-dev \
+    libjsoncpp-dev \
+    libunwind-dev \
+    libnuma-dev \
+    libpython3-dev \
+    libboost-all-dev \
+    libssl-dev \
+    libgrpc-dev \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    libyaml-cpp-dev \
+    protobuf-compiler-grpc \
+    libcurl4-openssl-dev \
+    libhiredis-dev \
+    liburing-dev \
+    libjemalloc-dev \
+    libmsgpack-dev \
+    libzmq3-dev \
+    libzstd-dev \
+    libasio-dev \
+    libxxhash-dev \
+    libgtest-dev \
+    pybind11-dev \
+    pkg-config \
+    patchelf \
+    libc6-dev \
+    libc-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── 2. yalantinglibs (GitHub 不可达 → 本地镜像 tarball; FindYLT.cmake 用
+#      ${GH_MIRROR}https://github.com/... 拼 URL, file:// 前缀直接读本地) ──
+COPY mirror/ /tmp/mirror/
+
+# ── 3. mooncake 源码 + yalantinglibs 预置源码 (离线构建, FindYLT.cmake 已补丁绕过 FetchContent) ──
+#    ⚠ 先备份基础镜像的旧 MACA TE (0.3.6.post1, PD 传输全天验证可用; 新版 TE 跨节点挂死)
+RUN cp /opt/conda/lib/python3.12/site-packages/mooncake/engine.so /opt/engine-maca-036.so && \
+    ls -la /opt/engine-maca-036.so
+COPY Mooncake-main/ /tmp/Mooncake/
+COPY ylt-src/ /tmp/ylt-src/
+
+# ── 4. MACA 构建 + 安装 (mooncake_master/mooncake_client/python 包) ──
+RUN export LIBRARY_PATH=${MACA_HOME}/lib:${MACA_HOME}/lib64:${LIBRARY_PATH:-} && \
+    export LD_LIBRARY_PATH=${MACA_HOME}/lib:${MACA_HOME}/lib64:${LD_LIBRARY_PATH:-} && \
+    cd /tmp/Mooncake && mkdir -p build && cd build && \
+    cmake -G Ninja .. \
+      -DUSE_MACA=ON \
+      -DBUILD_UNIT_TESTS=OFF \
+      -DBUILD_EXAMPLES=OFF \
+      -DUSE_HTTP=ON \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DPython3_EXECUTABLE=/opt/conda/bin/python3 && \
+    cmake --build . -j$(nproc) && \
+    cmake --install . && \
+    echo "=== 构建产物检查 ===" && \
+    find / -name "mooncake_client" -type f 2>/dev/null | head -3 && \
+    /opt/conda/bin/python3 -c "import mooncake; print('mooncake OK')" 2>&1 | tail -1
+
+# ── 5. OpenSSL 修正 (关键) ──
+# 运行时 LD_LIBRARY_PATH=/opt/conda/lib 会抢先加载 conda 的 libssl.so.3
+# (要求 OPENSSL_3.3.0, 系统 libcrypto.so.3=3.0.2 无此符号 → import 崩)。
+# patchelf --force-rpath (DT_RPATH 优先于 LD_LIBRARY_PATH) 强制指向系统 openssl。
+RUN for f in /opt/conda/lib/python3.12/site-packages/mooncake/*.so \
+             /usr/local/bin/mooncake_client /usr/local/bin/mooncake_master; do \
+      patchelf --force-rpath --set-rpath '$ORIGIN:$ORIGIN/../mooncake_transfer_engine.libs:/usr/lib/x86_64-linux-gnu:/usr/local/lib' "$f" && echo "patched: $f"; \
+    done
+
+# ── 6. ⭐ 混合方案: 恢复旧 MACA TE (PD 传输用) ──
+#   新版 0.3.13 TE 的 MACA transport 跨节点传输坏 (session 挂死/submitTransfer failed
+#   "device memory not registered"), 而旧 0.3.6.post1 (MetaX MACA 重建) 全天 PD 传输验证可用。
+#   存储路径 (mooncake.store + mooncake_client, dummy client L3) 不依赖 engine.so
+#   (已 ldd 验证), 故安全替换 engine*.so 为旧版。
+RUN D=/opt/conda/lib/python3.12/site-packages/mooncake && \
+    cp /opt/engine-maca-036.so $D/engine.so && \
+    cp /opt/engine-maca-036.so $D/engine.cpython-312-x86_64-linux-gnu.so && \
+    for f in $D/engine.so $D/engine.cpython-312-x86_64-linux-gnu.so; do \
+      patchelf --force-rpath --set-rpath '$ORIGIN:$ORIGIN/../mooncake_transfer_engine.libs:/usr/lib/x86_64-linux-gnu:/usr/local/lib' "$f"; \
+    done
+COPY verify_engine.py /tmp/verify_engine.py
+RUN /opt/conda/bin/python3 /tmp/verify_engine.py 2>&1 | tail -3
+
+# ── 7. metax 补丁: standalone_storage 在 DSv4 混合池下误判 ──
+#   (anchor=LogicalHostPool, allocator=None → 原检查必败; 改查实体子池)
+COPY patch_metax_dsv4_standalone.py /tmp/patch_metax_dsv4_standalone.py
+RUN /opt/conda/bin/python3 /tmp/patch_metax_dsv4_standalone.py && \
+    /opt/conda/bin/python3 -c "import ast; ast.parse(open('/opt/conda/lib/python3.12/site-packages/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py').read()); print('语法 OK')"
+
+# ── 8. 验证 (引擎侧 API 兼容性) ──
+COPY verify.py /tmp/verify.py
+RUN /opt/conda/bin/python3 /tmp/verify.py 2>&1 | tail -5
+
+# 收尾: 移除构建源码 (镜像瘦身), 保留产物
+RUN rm -rf /tmp/Mooncake /tmp/mirror /tmp/ylt-src /tmp/ylt.tar.gz || true
+
+CMD ["/bin/bash"]

@@ -1,0 +1,68 @@
+# mooncake-client DaemonSet — Dummy Client 模式的 Real Client (2026-09-27)
+# 官方解耦方案: SGLang (Dummy Client) 经 127.0.0.1:50052 连本机 Real Client,
+# 引擎不再自持 RDMA/段注册 → 规避嵌入模式的 MACA buffer 布局竞态。
+# 每个 prefill 节点一个, 贡献 8gb 段 → 4 × 8gb = 32 GiB 全局池。
+# ⚠ 必须 privileged (容器才能看到 /dev/infiniband → RDMA), MC_MS_AUTO_DISC=0 显式用卡
+#   (镜像 0.5.13-dsv4-adapter-r4-hicache-l2-mc013 含 /usr/local/bin/mooncake_client)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mooncake-client
+  labels:
+    llm-d.ai/role: mooncake-client
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  selector:
+    matchLabels:
+      llm-d.ai/role: mooncake-client
+  template:
+    metadata:
+      labels:
+        llm-d.ai/role: mooncake-client
+        llm-d.ai/guide: pd-disaggregation
+    spec:
+      nodeSelector:
+        metax-sglang-pd-prefill-hicache: "true"
+      hostNetwork: true
+      hostIPC: true
+      hostPID: true
+      containers:
+        - name: mooncake-client
+          image: harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2-mc013
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          command: ["/usr/local/bin/mooncake_client"]
+          args:
+            - "--master_server_address=10.66.3.36:50051"
+            - "--metadata_server=http://10.66.3.36:8080/metadata"
+            # ⚠ 按官方文档用默认 host=0.0.0.0 (绑全部接口 → SGLang 走 127.0.0.1:50052 可达);
+            #   设成 POD_IP 会只绑节点 IP, loopback 连接被拒 (Failed to connect to real client)
+            - "--port=50052"
+            - "--protocol=rdma"
+            - "--device_names=mlx5_0,mlx5_1"
+            - "--global_segment_size=64gb"
+            - "--threads=4"
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: MC_MS_AUTO_DISC
+              value: "0"
+            - name: LD_LIBRARY_PATH
+              value: /opt/maca/lib:/opt/maca/lib64:/usr/local/lib:/opt/conda/lib
+          ports:
+            - name: rpc
+              containerPort: 50052
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 15
+            periodSeconds: 15

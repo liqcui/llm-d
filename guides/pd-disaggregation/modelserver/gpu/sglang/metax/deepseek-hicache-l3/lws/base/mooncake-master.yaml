@@ -1,0 +1,34 @@
+# Mooncake Master — HiCache L3 全局元数据服务 (2026-09-26)
+# 端口: 50051 RPC / 8080 Metadata HTTP(嵌入式) / 9003 Metrics
+# 镜像: 0.5.13-dsv4-adapter-r4 (内含 /opt/conda/bin/mooncake_master; 必须与
+#   prefill client 同血统, 跨版本 → RPC call failed: invalid rpc arg / error -900)
+# ⚠ 嵌入式 metadata server (--enable_http_metadata_server) 免单独部署 http_metadata_server
+#   (Mooncake 官方指南); --eviction_high_watermark_ratio=0.95 为官方推荐值。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mooncake-master
+  labels:
+    llm-d.ai/role: mooncake-master
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  nodeName: mxgpu-3-36
+  restartPolicy: Always
+  hostNetwork: true
+  containers:
+    - name: master
+      image: harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2-mc013
+      imagePullPolicy: Always
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          export LD_LIBRARY_PATH=/opt/conda/lib:${LD_LIBRARY_PATH:-}
+          # 0.3.13 (mc013 镜像, /usr/local/bin; 与 Real Client 同版本)
+          exec /usr/local/bin/mooncake_master \
+            --rpc_address=0.0.0.0 \
+            --rpc_port=50051 \
+            --enable_http_metadata_server=true \
+            --http_metadata_server_host=0.0.0.0 \
+            --http_metadata_server_port=8080 \
+            --metrics_port=9003 \
+            --eviction_high_watermark_ratio=0.95

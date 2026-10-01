@@ -1,0 +1,68 @@
+# Decode 节点独立 Mooncake Store Service — L3 池容量解耦 (2026-09-27)
+# 对齐 GPUStack 报告 §16 + Mooncake 官方指南:
+#   - decode 推理进程不开 HiCache、不改任何参数, 仅由本 Pod 把 CPU DRAM 贡献给
+#     Mooncake Global Pool (容量与推理角色解耦)
+#   - local_buffer_size=0: 仅作 Store Server, 不发起 Get/Put
+#   - 配置走 JSON (镜像内 mooncake_config.py 必须 MOONCAKE_CONFIG_PATH 指向文件;
+#     报告 §16.2 同款 --config= 形式)
+# 部署在 decode 节点 mxgpu-3-34 (hostNetwork; 端口 8081 不与 decode 8200/8998 冲突)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mooncake-store-decode-config
+  labels:
+    llm-d.ai/role: mooncake-store-decode
+    llm-d.ai/guide: pd-disaggregation
+data:
+  config.json: |
+    {
+      "local_hostname": "10.66.3.34",
+      "metadata_server": "http://10.66.3.36:8080/metadata",
+      "master_server_address": "10.66.3.36:50051",
+      "protocol": "rdma",
+      "device_name": "mlx5_0,mlx5_1",
+      "global_segment_size": 4294967296,
+      "local_buffer_size": 0
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mooncake-store-decode
+  labels:
+    llm-d.ai/role: mooncake-store-decode
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  nodeName: mxgpu-3-34
+  restartPolicy: Always
+  hostNetwork: true
+  hostIPC: true
+  hostPID: true
+  containers:
+    - name: store
+      image: harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2-mc013
+      imagePullPolicy: Always
+      # ⚠ 必须 privileged (对齐引擎 pod prefill.yaml:375 / decode.yaml:430):
+      #   否则容器设备 cgroup 不含 /dev/infiniband → mooncake RDMA 初始化 0 HCA → 退 TCP
+      securityContext:
+        privileged: true
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          export LD_LIBRARY_PATH=/opt/conda/lib:${LD_LIBRARY_PATH:-}
+          exec python3 -m mooncake.mooncake_store_service --port=8081
+      env:
+        - name: MOONCAKE_CONFIG_PATH
+          value: /etc/mooncake/config.json
+        # ⚠ 必须: 禁用网卡自动发现 (auto-disc 在本环境扫到 0 张 HCA, 会退 TCP),
+        #   显式用 config.json 的 device_name=mlx5_0,mlx5_1 (prefill 侧 config.sh 同样 MC_MS_AUTO_DISC=0)
+        - name: MC_MS_AUTO_DISC
+          value: "0"
+      volumeMounts:
+        - name: store-config
+          mountPath: /etc/mooncake
+          readOnly: true
+  volumes:
+    - name: store-config
+      configMap:
+        name: mooncake-store-decode-config
