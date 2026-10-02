@@ -349,3 +349,46 @@ curl -s --max-time 120 -X POST http://<epp-pod-ip>:8081/v1/chat/completions \
 | 参数化 | 硬编码 | ConfigMap + 运行时 sed | **env 驱动的双模式启动器** |
 | 启动方式 | 官方脚本 | 官方脚本 + sed | **explicit（默认）/ official 可选** |
 | 节点标签 | `...-prefill/-decode` | `...-prefill-dsv4/-decode-dsv4` | `...-prefill-dsv4rc3/-decode-dsv4rc3` |
+
+## 10. 镜像固化：retract/offload 双缺陷补丁（2026-10-02）
+
+### 背景（完整复盘见 `~/sglang-benchmark-tools/docs/FAILURES-2026-10-02.md`）
+
+decode 组在 96/128 并发、65K 长上下文、凌晨自发等场景下**必崩**的根因是两个串联缺陷：
+
+- **缺陷A**：`schedule_batch.py release_req` 未按 `disaggregation_decode_enable_offload_kvcache`
+  判门即调 `offload_kv_cache` → 混合 SWA 池 `get_cpu_copy` 未实现 → `NotImplementedError`。
+- **缺陷B**：修复 A 后 `resume_retracted_reqs` 无条件 `load_kv_cache` →
+  `AttributeError: 'Req' object has no attribute 'kv_cache_cpu'`（本 fork 的
+  disagg-decode retract/resume 流程硬依赖 CPU offload）。
+
+此前 9+ 次 decode 全组崩溃全部由此机制产生（"Gloo/TCPStore connection reset" 均为次级现象）。
+
+### 修复（patch v2，2026-10-02 已固化进镜像）
+
+- **A**：`release_req` 补 gate（本部署 offload=False，行为不变）。
+- **B1/B2/B3**：`retract_decode` 无 offload 能力时 **retract 改为直接 abort 该请求**
+  （复用文件内 `reqs_to_abort` 通道 → 客户端 500、服务不崩 = 优雅降级）。
+- **候选**：`func_timer.py` 防重启 `DuplicateTimeseries`（复用已注册 collector）。
+
+**固化方式（重要）**：2026-10-02 起补丁**内置在镜像中**，不再依赖运行期注入：
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `harbor.isuanova.com/metax/sglang:0.5.12-maca.ai3.8.2.7-torch2.10-py312-ubuntu22.04-amd64-llm`（**覆盖原 tag**，imagePullPolicy=Always） |
+| 新 digest | `sha256:c03585b880739ff5a4aeb40783dc16e9801b7b5942581be51e1034c6dd7b75bf` |
+| 补丁源文件 | `~/sglang-benchmark-tools/docs/patches/0001-schedule_batch-retract-offload-fix.patch`（必打）、`0002-func_timer-dedup-guard.patch`（候选） |
+| 构建方式 | 本机 docker build（`/tmp/sglang-image-fix/apply_patches.py`，严格模式：替换失败即构建失败） |
+
+**本文件（decode.yaml）已删除 boot 注入段**（原 `[BH-patch]` python 注入，镜像更新后不再需要）。
+⚠ 后续再换镜像时必须确认 0001 补丁已在镜像内，否则双缺陷崩溃会回归
+（可用 `docker run --rm <img> grep -c "BH-patch2" <schedule_batch.py>` 验证）。
+
+**验证状态**：
+- 2026-10-02 晚（boot 注入版，patch v2）：128@5.0×300 → 300/300（2050 tok/s）、8×65K×100 → 100/100
+- 2026-10-02 镜像固化版（baked-in）：静态验证 ✅（A/B1/B2/B3/func_timer 标记 + py_compile 全过）；
+  压测复测见 sglbench runs（label `img-fixed-r5` / `img-fixed-8c65k`）。
+
+**其它同期改动**：`SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK` 已废弃（`environ.py:718` 仅剩
+`SGL_DISABLE_*` 别名；`model_runner.py:1331` 实际读取 `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK`）→
+统一改为 `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK: "0"`（显式关闭，语义不变）。

@@ -112,76 +112,6 @@ spec:
                 # C500 JIT 缓存清理 (与 GLM / dsv4 方案对齐)
                 rm -rf /root/.cache/tvm-ffi
 
-                # ── 运行时补丁: retract/offload 双缺陷 (2026-10-02 实测崩溃链) ──
-                # 缺陷A: release_req 未按 disaggregation_decode_enable_offload_kvcache 判门即调
-                #   offload_kv_cache, 混合 SWA 池 get_cpu_copy 未实现 → NotImplementedError 崩溃。
-                # 缺陷B: 修复A后 retract 能跑, 但 resume_retracted_reqs 无条件 load_kv_cache
-                #   → AttributeError: 'Req' object has no attribute 'kv_cache_cpu' 仍崩。
-                # 修补: A=补 gate (不改行为, 因该参数=False); B=无 offload 能力时 retract 改为
-                #   直接 abort 该请求 (客户端 500, 服务不崩 = 优雅降级; 复用文件内 reqs_to_abort
-                #   通道)。⚠ 镜像更新后应删除本补丁段。
-                SCHED_BATCH=/opt/conda/lib/python3.12/site-packages/sglang/srt/managers/schedule_batch.py
-                /opt/conda/bin/python3 - "${SCHED_BATCH}" <<'PYEOF' || true
-                import py_compile, sys
-                p = sys.argv[1]
-                src = open(p).read()
-                orig = src
-                if "[BH-patch" in src:
-                    print("[patch] already applied; skip")
-                else:
-                    old1 = 'if server_args.disaggregation_mode == "decode":\n            req.offload_kv_cache('
-                    new1 = 'if server_args.disaggregation_mode == "decode" and server_args.disaggregation_decode_enable_offload_kvcache:\n            req.offload_kv_cache('
-                    old2a = '        retracted_reqs = []\n        first_iter = True'
-                    new2a = '        retracted_reqs = []\n        reqs_to_abort: List[Req] = []  # [BH-patch2] 提前初始化\n        first_iter = True'
-                    old2b = '        reqs_to_abort: List[Req] = []\n        if len(sorted_indices) <= 1 and not self.check_decode_mem('
-                    new2b = '        if len(sorted_indices) <= 1 and not self.check_decode_mem('
-                    old2c = ('            first_iter = False\n'
-                             '            idx = sorted_indices.pop()\n'
-                             '            req = self.reqs[idx]\n'
-                             '            retracted_reqs.append(req)\n'
-                             '            # release memory and don\'t insert into the tree because we need the space instantly\n'
-                             '            self.release_req(idx, len(sorted_indices), server_args)')
-                    new2c = ('            first_iter = False\n'
-                             '            idx = sorted_indices.pop()\n'
-                             '            req = self.reqs[idx]\n'
-                             '            if not getattr(server_args, "disaggregation_decode_enable_offload_kvcache", False):\n'
-                             '                # [BH-patch2] 混合 SWA 池无 get_cpu_copy -> retract 后 resume 必崩\n'
-                             '                # (AttributeError: kv_cache_cpu)。无 offload 能力时直接 abort,\n'
-                             '                # 客户端收 500, 服务不崩 (优雅降级)。\n'
-                             '                req.to_finish = FINISH_ABORT(\n'
-                             '                    "Retracted due to KV cache pressure without CPU offload support; aborting.",\n'
-                             '                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,\n'
-                             '                )\n'
-                             '                reqs_to_abort.append(req)\n'
-                             '                self.release_req(idx, len(sorted_indices), server_args)\n'
-                             '            else:\n'
-                             '                retracted_reqs.append(req)\n'
-                             '                # release memory and don\'t insert into the tree because we need the space instantly\n'
-                             '                self.release_req(idx, len(sorted_indices), server_args)')
-                    ok = True
-                    for old, new, tag in ((old1, new1, "A-gate"), (old2a, new2a, "B1-decl"),
-                                          (old2b, new2b, "B2-dedup"), (old2c, new2c, "B3-abort")):
-                        if old in src:
-                            src = src.replace(old, new, 1)
-                            print(f"[patch] applied {tag}")
-                        elif new in src:
-                            print(f"[patch] {tag} already present")
-                        else:
-                            ok = False
-                            print(f"[patch][WARN] {tag} target not found (image changed?)")
-                    if ok:
-                        try:
-                            open(p, "w").write(src)
-                            py_compile.compile(p, doraise=True)
-                            print("[patch] all applied + py_compile OK")
-                        except Exception as e:
-                            open(p, "w").write(orig)
-                            print(f"[patch][WARN] compile failed, restored: {e}")
-                    else:
-                        open(p, "w").write(orig)
-                        print("[patch][WARN] incomplete match set, original restored (no changes)")
-                PYEOF
-
                 # 日志落盘: hostPath, Pod 重建后仍在。
                 # 每次启动独立文件 (rank<idx>-<mdd-hhmmss>.log), 不覆盖历史;
                 # 稳定路径 rank<idx>.log 是指向最新一代的符号链接; 每节点保留最近 20 份。
@@ -498,8 +428,8 @@ spec:
                 value: "1"
               - name: SGLANG_JIT_DEEPGEMM_PRECOMPILE
                 value: "0"
-              - name: SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
-                value: "1"
+              - name: SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK
+                value: "0"
               # idle 期池核算微差即 raise 并杀 scheduler → 显式关闭 strict 检查
               # (新镜像里该开关仍存在)
               - name: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
