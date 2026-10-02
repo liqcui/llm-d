@@ -446,6 +446,19 @@ data:
       fi
     }
 
+    # ── 字面量回写: 厂商把某些 flag 直接硬编码在 args 数组里 (无变量可 grep) ──
+    _override_literal() {
+      local pattern="$1" replacement="$2" file="$3" label="$4"
+      [ -n "${pattern}" ] || return 0
+      [ -f "${file}" ] || { warn "字面量回写跳过: ${file} 不存在 (${label})"; return 0; }
+      if grep -qF -- "${pattern}" "${file}"; then
+        sed -i "s|${pattern}|${replacement}|" "${file}"
+        log "字面量回写: ${label}  [$(basename "${file}")]"
+      else
+        warn "字面量回写跳过: $(basename "${file}") 中未找到 '${pattern}' (镜像脚本已变更?)"
+      fi
+    }
+
     _print_summary() {
       log "============================================================"
       log "DeepSeek-V4 (rc3-maca) PD Launcher — Startup Summary"
@@ -607,6 +620,18 @@ data:
           log "EPLB 未启用 (PD_EPLB_ENABLE=${PD_EPLB_ENABLE:-<未设置>}) → 回写空值;"
           log "  厂商默认指向镜像内不存在的 /workspace/eplb/... , 要用请挂载文件并置 PD_EPLB_ENABLE=1"
           _clear_var "decode_eplb_file_specific" "${mdl}"
+        fi
+
+        # SWA 池配额: 厂商 decode_model_args 里硬编码字面量 "--swa-full-tokens-ratio 0.1 #0.4"
+        # (无变量可 _override_var, 故走字面量回写)。
+        # 语义 (pool_configurator.py): swa 池容量 = full 池容量 × ratio, full 池按显存预算反比缩放。
+        # ⚠ 2026-10-02 实测: r=0.4 → full 池 201743→59904 (-70%), 由实测反解 SWA 层每 token
+        #   显存 ≈ full 层 37.5 倍 → swa 容量随 r 次线性增长 (r=0.1 已近极限), 调大 r 得不偿失。
+        #   **保持 0.1**; 本回写保留仅作为紧急调参通道 (默认值也设 0.1 以防误改)。改镜像后应删。
+        if [ -n "${PD_SWA_FULL_TOKENS_RATIO:-}" ]; then
+          _override_literal "--swa-full-tokens-ratio 0.1 #0.4" \
+                            "--swa-full-tokens-ratio ${PD_SWA_FULL_TOKENS_RATIO}" \
+                            "${mdl}" "swa-full-tokens-ratio=${PD_SWA_FULL_TOKENS_RATIO}"
         fi
       fi
     }

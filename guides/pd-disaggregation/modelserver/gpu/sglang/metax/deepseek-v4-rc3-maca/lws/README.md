@@ -4,8 +4,7 @@
 > 与 GLM 方案（`metax/lws/`）、DeepSeek-V4-Flash 方案（`metax/deepseek-v4-flash/`）互不覆盖，
 > 三者使用**互斥的节点标签**，可在同一集群共存。
 
-**状态**（2026-10-01：官方默认 vs 最优解同日对比完成，详见
-`BENCHMARK-COMPARISON-2026-10-01.md`；当前部署 = optimal 变体）：
+**状态**（2026-09-24，新集群实测）：
 - ✅ **端到端已跑通**：prefill 4/4 + decode 4/4 Ready，EPP 已发现两端点，
   `Client → EPP → decode sidecar → prefill(KV) → decode` 返回正确结果（见 §7）。
 - ⚠ **镜像已换为 `0.5.13-maca`（MACA 3.8.1.3）**，起因是新集群驱动栈
@@ -31,9 +30,9 @@ Router 连通性矩阵见 `TROUBLESHOOTING.md` §10；验收清单（含实测�
 | 镜像 | `harbor.isuanova.com/metax/sglang:0.5.13-maca.ai3.8.1.3-torch2.10-py312-ubuntu22.04-amd64`（2026-09-24 由 rc3 镜像换为 0.5.13，见 §13） |
 | 启动模式 | `explicit`（标准 `sglang.launch_server` argv；该镜像无厂商脚本） |
 | 拓扑 | **每角色 1 个 4 节点逻辑实例**：LWS `replicas=1, size=4` → 4 pods / 4 节点 / 32 卡 |
-| 并行度 | 双变体: **官方默认** decode tp32/dp32/ep32 + prefill tp4/pp8/dp1 ／ **最优** tp8 dp4 ep8 + pp1 (见 §3) |
+| 并行度 | `tp=8 dp=4 ep=8`（4 节点各 1 个 DP replica），`pp=1` |
 | 网关 | **双网关**：llm-d EPP（规范入口）+ sglang router（对比入口），同一套 4P+4D 后端 |
-| 参数入口 | `official/` 或 `optimal/` 的 `decode.yaml` / `prefill.yaml` 的 `env:` 块（唯一入口） |
+| 参数入口 | `base/prefill.yaml` / `base/decode.yaml` 的 `env:` 块（唯一入口） |
 
 ## 2. 架构
 
@@ -67,29 +66,16 @@ Client ──┬─→ EPP ──────────→ decode pod routing-
 
 ```
 deepseek-v4-rc3-maca/lws/
-├── deploy.sh                   # 一键部署/切换: ./deploy.sh <official|optimal> [apply|delete]
-│                               #   apply 后自动等 pod Ready + 同步 router 端点 + 建压测 pod
-├── official/                   # ═ 变体 A: 沐曦官方默认参数 (独立 kustomize 目录) ═
-│   ├── kustomization.yaml      #   namespace + images + 资源清单 (共用 ../shared)
-│   ├── decode.yaml             #   官方默认: tp32/dp32/ep32/pp1, mem 0.80, EAGLE=3, EPLB 关
-│   └── prefill.yaml            #   官方默认: tp4/pp8/dp1, mem 0.80
-├── optimal/                    # ═ 变体 B: 最优解 (独立 kustomize 目录) ═
-│   ├── kustomization.yaml
-│   ├── decode.yaml             #   tp8/dp4/ep8/pp1, mem 0.75, EAGLE=5, EPLB 开
-│   └── prefill.yaml            #   tp8/dp4/pp1, mem 0.82
-├── shared/                     # 两变体共用 (只维护一份)
-│   ├── router.yaml             # sglang router Deployment (对比网关)
-│   ├── services.yaml           # prefill/decode headless (仅 worker-index=0)
-│   ├── serviceAccount.yaml
-│   ├── launcher-configmap.yaml # 双模式启动器 (env → argv, 或调官方脚本)
-│   └── rbac.yaml
-├── bench/
-│   └── bench-client.yaml       # 压测客户端 pod (metax/sglang:benchmark 镜像, 内置 ShareGPT)
-└── README.md
+├── kustomization.yaml          # 部署入口 (namespace: metax-ai-pd; images: 集中覆盖镜像)
+├── README.md
+└── base/
+    ├── prefill.yaml            # LWS prefill-dsv4rc3: replicas=1 size=4
+    ├── decode.yaml             # LWS decode-dsv4rc3:  replicas=1 size=4 + routing-proxy sidecar
+    ├── router.yaml             # sglang router Deployment (对比网关)
+    ├── services.yaml           # prefill/decode headless (仅 worker-index=0)
+    ├── serviceAccount.yaml
+    └── launcher-configmap.yaml # 双模式启动器 (env → argv, 或调官方脚本)
 ```
-
-**切换变体不需要改任何 yaml**: `./deploy.sh official` 或 `./deploy.sh optimal` 即可
-(两套差异全在 official/ 与 optimal/ 的 decode.yaml/prefill.yaml env 值; shared/ 只维护一份)。
 
 ## 4. 两种启动模式
 
@@ -284,18 +270,22 @@ kubectl label node <p1> <p2> <p3> <p4> metax-sglang-pd-prefill-dsv4rc3=true --ov
 kubectl label node <d1> <d2> <d3> <d4> metax-sglang-pd-decode-dsv4rc3=true  --overwrite
 kubectl label node <r1>                  metax-sglang-pd-router-dsv4rc3=true  --overwrite
 
-# 2) 部署 (官方默认变体; 最优解把 official 换成 optimal)
-cd guides/pd-disaggregation/modelserver/gpu/sglang/metax/deepseek-v4-rc3-maca/lws
-./deploy.sh official
-#   = kubectl apply -k official/ + 等待两组 pod Ready + 自动同步 router 端点
-#     (leader 漂移自动修复) + 自动创建压测 pod bench/bench-client.yaml
+# 2) 先只建 Service, 拿 leader 稳定入口的 ClusterIP (对比网关用; 不用可跳过)
+kubectl -n metax-ai-pd apply -f .../deepseek-v4-rc3-maca/lws/base/services.yaml
+kubectl -n metax-ai-pd get svc prefill-dist-master decode-dist-master \
+  -o custom-columns=NAME:.metadata.name,IP:.spec.clusterIP
+#    → 回填 base/router.yaml 的 PD_PREFILL_ENDPOINTS(<ClusterIP>:8000) /
+#      PD_DECODE_ENDPOINTS(<ClusterIP>:8200)。不用对比网关时, 把 router.yaml
+#      从 base/kustomization.yaml 的 resources 里去掉即可。
+#    ⛔ 这两个 ClusterIP **只给客户端(router)用**, 不要填进 PD_MASTER_IP (见 §5.1)
 
-# 3) 切换变体: 直接部署另一个即可 (LWS 整组重建, 旧组等待 ≥120s 释放端口)
-./deploy.sh optimal
+# 3) (推荐) 先干跑: 把两个 LWS 的 PD_DRY_RUN 置 "1", 只打印 argv 不拉引擎
+# 4) 正式部署 (PD_MASTER_IP 保持空, 无需手工填任何 IP)
+kubectl apply -k guides/pd-disaggregation/modelserver/gpu/sglang/metax/deepseek-v4-rc3-maca/lws/
 ```
 
-回滚：`./deploy.sh <official|optimal> delete`（= `kubectl delete -k <变体目录>`）。
-改动 LWS 拓扑需整组重建（`RecreateGroupOnPodRestart`），重建前建议等待 ≥120s 让旧连接释放。
+回滚：`kubectl delete -k .../lws/`。改动 LWS 拓扑需整组重建
+（`RecreateGroupOnPodRestart`），重建前建议等待 ≥120s 让旧连接释放。
 
 ## 7. 验收清单（含实测结果）
 

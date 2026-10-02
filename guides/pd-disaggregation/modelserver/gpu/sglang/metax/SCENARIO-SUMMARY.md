@@ -14,7 +14,7 @@
 | 3 | 超长上下文（32K 单请求） | 同 #1 | ✅ 可用（低并发） | KV 池用量 97-98%，稳定；5-6 并发 32K 序列 |
 | 4 | 旧引擎对比（0.5.13） | 0.5.13-maca-llm | ❌ 弃用 | 120 tok/s（慢 8x）+ node33 illegal access |
 | 5 | 旧 MACA 对比（3.7.1.13） | 0.5.12-dsv4-c500-llm | ⚠ 次优 | 958 tok/s（比 3.8.2.6 低 29%），驱动不匹配风险 |
-| 6 | 厂商默认拓扑对比 | decode tp32/dp32/ep32 + prefill tp4/pp8 | ⚠ 差于最优但非 4x | 首轮 298 tok/s（JIT 热身，09-26 误记）；**2026-10-01 同日 7-8 轮全记录见 `deepseek-v4-rc3-maca/lws/BENCHMARK-COMPARISON-2026-10-01.md`**：Output 中位 982 vs 1019（峰值 1030 vs 1254）、TTFT 中位 3.2s vs 1.1s；❌ **1 小时压测崩 2 次**（prefill rank0 illegal access）+ 启动 25-40min（vs optimal 8min）|
+| 6 | 厂商默认拓扑对比 | decode tp32/dp32/ep32 + prefill tp4/pp8 | ❌ 弃用 | 298 tok/s，TTFT 29.9s（4.1x/36x 差）|
 | 7 | **HiCache L2+L3（32 卡跨节点）** | prefill r4(0.5.13)+hicache；tp8/pp4/dp1 | ⚠ **功能通/写回崩** | prefetch ✓ loaded=512；write_backup 触发 MACA transfer kernel Xnack 崩溃 |
 | 8 | **HiCache 单机 PP8/TP1**（GPUStack 原配方） | prefill r4；size=1；pp8/tp1 | ⚠ **同样崩溃**（验证实验） | 完全相同栈（`host_indices.to(device)` → Xnack）；**排除形态因素** |
 
