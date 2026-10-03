@@ -614,6 +614,33 @@ data:
         log "官方回写: 移除 models/<spec>.sh 的 --enable-dynamic-chunking (HiCache 不兼容, 见文档 §3.3)"
       fi
 
+      # 文档对齐: --hicache-ratio 0.5 (sglang 默认 2.0; 文档验证组合用 0.5, host 池大小
+      #   影响 DMA 区域布局, 与 xnack atu 故障的可能相关)。注入到 prefill_model_args 数组。
+      if [ "${role}" = "prefill" ] && [ -n "${PD_HICACHE_RATIO:-}" ] \
+         && ! grep -q -- '--hicache-ratio' "${mdl}"; then
+        sed -i "s|^readonly prefill_model_args=(|readonly prefill_model_args=(\n    --hicache-ratio ${PD_HICACHE_RATIO}|" "${mdl}"
+        log "官方回写: models/<spec>.sh 增加 --hicache-ratio ${PD_HICACHE_RATIO} (文档对齐)"
+      fi
+
+      # 2026-10-03 晚: HiCache 官方博客验证组合 = kernel + page_first (我们此前跑的是
+      #   默认 layer_first)。page-first 是官方 IO 优化路径 (GPU-assisted I/O kernels +
+      #   zero-copy 针对该布局), layer_first host 布局未经官方 benchmark 验证。
+      #   xnack(0x8) atu 崩溃排查实验。
+      if [ "${role}" = "prefill" ] && [ -n "${PD_HICACHE_MEM_LAYOUT:-}" ] \
+         && ! grep -q -- '--hicache-mem-layout' "${mdl}"; then
+        sed -i "s|^readonly prefill_model_args=(|readonly prefill_model_args=(\n    --hicache-mem-layout ${PD_HICACHE_MEM_LAYOUT}|" "${mdl}"
+        log "官方回写: models/<spec>.sh 增加 --hicache-mem-layout ${PD_HICACHE_MEM_LAYOUT} (官方验证组合)"
+      fi
+
+      # 2026-10-03 晚最终旋钮: --hicache-write-policy write_back (默认 write_through 每条
+      #   请求都写 host; write_back 仅淘汰时写回, 大幅降低 host DMA 频率——博客推荐用于
+      #   内存层容量受限场景)。xnack atu 崩溃最后的规避尝试。
+      if [ "${role}" = "prefill" ] && [ -n "${PD_HICACHE_WRITE_POLICY:-}" ] \
+         && ! grep -q -- '--hicache-write-policy' "${mdl}"; then
+        sed -i "s|^readonly prefill_model_args=(|readonly prefill_model_args=(\n    --hicache-write-policy ${PD_HICACHE_WRITE_POLICY}|" "${mdl}"
+        log "官方回写: models/<spec>.sh 增加 --hicache-write-policy ${PD_HICACHE_WRITE_POLICY}"
+      fi
+
       if [ "${role}" = "decode" ]; then
         # MTP/EAGLE: 厂商由此推导 --speculative-num-steps=draft-1 / topk=1
         if [ "${PD_SPECULATIVE_ENABLE:-1}" = "0" ]; then
