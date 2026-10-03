@@ -9,4 +9,4 @@ resources:
   - serviceAccount.yaml
   - launcher-configmap.yaml
   - rbac.yaml
-  - mooncake-master.yaml
+  # L3 (mooncake store/master) 已于 2026-10-03 移除 — 本部署为纯 L2
