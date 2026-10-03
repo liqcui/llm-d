@@ -198,7 +198,9 @@ spec:
               #   prefetch 成功后 kernel 越界, 疑 direct IO (零拷贝) 原生栈问题。
               #   按 SGLang HiCache 最佳实践改 kernel 后端 (经 kernel 拷贝更保守)。
               - name: MY_HICACHE_IO_BACKEND
-                value: "direct"
+                value: "kernel"   # ⚠ 2026-10-03 16:45 起改 kernel: direct 零拷贝 DMA 在持续负载下
+                                  #   xnack(0x8) atu address translation error (14:11 65K / 16:45 conc-64
+                                  #   两次崩溃, prefill leader)。kernel 后端经拷贝更保守 (09-26 已标注)。
               # ⚠ 2026-09-26 CUDA_LAUNCH_BLOCKING=1 诊断结论: **不可用** ——
               #   blocking 模式下 hicache 初始化卡死 (>25min 无进展, 引擎日志停摆),
               #   且无法验证 transfer kernel 竞态假设。已回退。

@@ -446,6 +446,19 @@ data:
       fi
     }
 
+    # ── 字面量回写: 厂商把某些 flag 直接硬编码在 args 数组里 (无变量可 grep) ──
+    _override_literal() {
+      local pattern="$1" replacement="$2" file="$3" label="$4"
+      [ -n "${pattern}" ] || return 0
+      [ -f "${file}" ] || { warn "字面量回写跳过: ${file} 不存在 (${label})"; return 0; }
+      if grep -qF -- "${pattern}" "${file}"; then
+        sed -i "s|${pattern}|${replacement}|" "${file}"
+        log "字面量回写: ${label}  [$(basename "${file}")]"
+      else
+        warn "字面量回写跳过: $(basename "${file}") 中未找到 '${pattern}' (镜像脚本已变更?)"
+      fi
+    }
+
     _print_summary() {
       log "============================================================"
       log "DeepSeek-V4 (rc3-maca) PD Launcher — Startup Summary"
@@ -581,6 +594,17 @@ data:
                     "${prefill_max_running_requests_pre_batch:-}" "${cfg}"
       _override_var "decode_max_running_requests_specific" \
                     "${decode_max_running_requests_specific:-}" "${mdl}"
+
+      # HiCache L2 (prefill): 厂商 prefill.sh:113 硬编码 --hicache-io-backend="direct"
+      #   (choices: direct/kernel/kernel_ascend)。⚠ 10-03 实测 direct 零拷贝 DMA 在持续
+      #   负载下 xnack(0x8) atu address translation error 崩 (14:11 65K / 16:45 conc-64),
+      #   与 09-27 L3 同类平台故障 → 用 MY_HICACHE_IO_BACKEND 字面量回写切 kernel
+      #   (经拷贝更保守)。改镜像后应删。
+      if [ "${role}" = "prefill" ] && [ -n "${MY_HICACHE_IO_BACKEND:-}" ]; then
+        _override_literal '--hicache-io-backend="direct"' \
+                          "--hicache-io-backend=\"${MY_HICACHE_IO_BACKEND}\"" \
+                          "${cfg%/*}/prefill.sh" "hicache-io-backend=${MY_HICACHE_IO_BACKEND}"
+      fi
 
       if [ "${role}" = "decode" ]; then
         # MTP/EAGLE: 厂商由此推导 --speculative-num-steps=draft-1 / topk=1
