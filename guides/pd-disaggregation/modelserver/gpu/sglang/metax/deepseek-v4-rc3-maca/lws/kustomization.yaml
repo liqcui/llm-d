@@ -36,6 +36,7 @@ namespace: metax-ai-pd
 
 resources:
   - base
+  - shared
 
 # 镜像集中覆盖: 换仓库/换 tag 只改这里
 images:

@@ -66,15 +66,19 @@ Client ──┬─→ EPP ──────────→ decode pod routing-
 
 ```
 deepseek-v4-rc3-maca/lws/
-├── kustomization.yaml          # 部署入口 (namespace: metax-ai-pd; images: 集中覆盖镜像)
+├── kustomization.yaml          # 部署入口 (namespace: metax-ai-pd; images: 集中覆盖镜像; resources: base+shared)
 ├── README.md
-└── base/
-    ├── prefill.yaml            # LWS prefill-dsv4rc3: replicas=1 size=4
-    ├── decode.yaml             # LWS decode-dsv4rc3:  replicas=1 size=4 + routing-proxy sidecar
+├── base/                       # 模型服务 LWS (镜像经入口 images: 集中覆盖)
+│   ├── kustomization.yaml
+│   ├── prefill.yaml            # LWS prefill-dsv4rc3: replicas=1 size=4
+│   └── decode.yaml             # LWS decode-dsv4rc3:  replicas=1 size=4 + routing-proxy sidecar
+└── shared/                     # 支撑资源 (与 base 同属一个 kustomize 构建)
+    ├── kustomization.yaml
     ├── router.yaml             # sglang router Deployment (对比网关)
     ├── services.yaml           # prefill/decode headless (仅 worker-index=0)
     ├── serviceAccount.yaml
-    └── launcher-configmap.yaml # 双模式启动器 (env → argv, 或调官方脚本)
+    ├── launcher-configmap.yaml # 双模式启动器 (env → argv, 或调官方脚本)
+    └── rbac.yaml
 ```
 
 ## 4. 两种启动模式

@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 支撑资源: router (对比网关) / headless services / ServiceAccount / RBAC / launcher ConfigMap
+resources:
+  - router.yaml
+  - services.yaml
+  - serviceAccount.yaml
+  - launcher-configmap.yaml
+  - rbac.yaml
