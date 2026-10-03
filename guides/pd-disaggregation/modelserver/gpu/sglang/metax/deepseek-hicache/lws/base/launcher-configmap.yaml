@@ -606,6 +606,14 @@ data:
                           "${cfg%/*}/prefill.sh" "hicache-io-backend=${MY_HICACHE_IO_BACKEND}"
       fi
 
+      # ⚠ 文档 §3.3: Dynamic Chunking + HiCache 组合路径不完整 (page 泄漏/pool 状态损坏;
+      #   0.5.12 定性, 0.5.13 未验证) → 从 models/<spec>.sh 移除该 flag (官方模式
+      #   PD_EXTRA_ARGS 不生效, 该 flag 由厂商脚本硬编码)。2026-10-03 xnack 崩溃的上游假设。
+      if [ "${role}" = "prefill" ] && grep -q -- '--enable-dynamic-chunking' "${mdl}"; then
+        sed -i '/^[[:space:]]*--enable-dynamic-chunking[[:space:]]*$/d' "${mdl}"
+        log "官方回写: 移除 models/<spec>.sh 的 --enable-dynamic-chunking (HiCache 不兼容, 见文档 §3.3)"
+      fi
+
       if [ "${role}" = "decode" ]; then
         # MTP/EAGLE: 厂商由此推导 --speculative-num-steps=draft-1 / topk=1
         if [ "${PD_SPECULATIVE_ENABLE:-1}" = "0" ]; then

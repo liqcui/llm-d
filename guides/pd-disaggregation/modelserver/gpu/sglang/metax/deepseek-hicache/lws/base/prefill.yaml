@@ -142,7 +142,11 @@ spec:
               #   prefill 不抓 CUDA graph (厂商注释: --disable-cuda-graph), 也是 node 36
               #   那类 graph 捕获期 GPU 故障不会出现在 prefill 的原因。
               - name: PD_EXTRA_ARGS
-                value: "--disable-cuda-graph --disable-radix-cache --enable-dynamic-chunking"
+                value: "--disable-cuda-graph --disable-radix-cache"
+                # ⚠ 2026-10-03 移除 --enable-dynamic-chunking: 文档 (MetaX HiCache 问题总结 §3.3)
+                #   定性 Dynamic Chunking + HiCache 组合路径不完整 (page 泄漏/pool 状态损坏,
+                #   0.5.12; 0.5.13 未验证)。本次 xnack(0x8) atu 崩溃的合理上游。
+                #   保留 --chunked-prefill-size=4096 (PD_CHUNKED_PREFILL_SIZE)。
               - name: PD_SWA_FULL_TOKENS_RATIO
                 value: "0.2"                      # 厂商 prefill 0.2 (decode 是 0.4)
               # official 模式: 并发用厂商 prefill_max_running_requests_pre_batch(64),
