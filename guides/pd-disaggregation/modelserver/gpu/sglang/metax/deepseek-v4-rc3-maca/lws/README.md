@@ -388,10 +388,16 @@ decode 组在 96/128 并发、65K 长上下文、凌晨自发等场景下**必�
 ⚠ 后续再换镜像时必须确认 0001 补丁已在镜像内，否则双缺陷崩溃会回归
 （可用 `docker run --rm <img> grep -c "BH-patch2" <schedule_batch.py>` 验证）。
 
-**验证状态**：
+**验证状态**（均为 0 崩溃 / 0 pod 重启 / 0 错误）：
 - 2026-10-02 晚（boot 注入版，patch v2）：128@5.0×300 → 300/300（2050 tok/s）、8×65K×100 → 100/100
-- 2026-10-02 镜像固化版（baked-in）：静态验证 ✅（A/B1/B2/B3/func_timer 标记 + py_compile 全过）；
-  压测复测见 sglbench runs（label `img-fixed-r5` / `img-fixed-8c65k`）。
+- 2026-10-03（**镜像固化版**，run `...T004108Z-98d2` / `...T004943Z-0398`，label `img-fixed-r5` / `img-fixed-8c65k`）：
+  - 128@5.0×300 → **300/300**（输出 2019.9 tok/s、TTFT 均值 12.26s、TPOT 均值 25.42ms）—— 与 boot 版等效（±1.5% 噪声）
+  - 8×65K×100 → **100/100**（TTFT 均值 46.22s、TPOT 均值 20.91ms）—— 与 boot 版等效
+  - 静态验证 ✅（A/B1/B2/B3/func_timer 标记 + py_compile 全过）；10-03 起 decode 日志无 `[patch]` 注入行
+  - 附带收益：本次应用把线上 `PD_SWA_FULL_TOKENS_RATIO` 从陈旧的 0.4 对齐为 0.1
+    （pool 实测 full=202496 / swa=20224），128 并发下 0 次 retraction（10-02 时 effective 0.4、
+    full 池 59.9K 容量不足 → 268 次 retract 全由 abort 通道消化）—— 补丁的优雅降级路径在
+    10-02 已验证，10-03 因池容量充足无需触发。
 
 **其它同期改动**：`SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK` 已废弃（`environ.py:718` 仅剩
 `SGL_DISABLE_*` 别名；`model_runner.py:1331` 实际读取 `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK`）→
