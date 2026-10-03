@@ -100,9 +100,9 @@ spec:
             # ⚠ leader 漂移 (整组重建后 worker-index=0 换节点) 需同步更新这两个 IP:
             #   kubectl -n metax-ai-pd get pods -l 'llm-d.ai/guide=pd-disaggregation' -o wide
             # 当前 (2026-09-26 0.5.12 重建后): prefill master=10.66.3.31 (node 31),
-            #   decode master=10.66.3.35 (node 35)。leader 漂移后必须同步更新!
+            #   ⚠ prefill leader 漂移 29→31 (10-03 14:11 组重建后)。leader 漂移后必须同步更新!
             - name: PD_PREFILL_ENDPOINTS
-              value: "10.66.3.29:8000"
+              value: "10.66.3.31:8000"
             - name: PD_DECODE_ENDPOINTS
               value: "10.66.3.35:8200"
             - name: PD_BOOTSTRAP_PORT
