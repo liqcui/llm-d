@@ -249,7 +249,9 @@ spec:
               #   (explicit 模式才需要 PD_MAX_RUNNING_REQUESTS 填乘完的终值)
               # 厂商 decode.sh 实测值 (prefill 侧是 0.2, 两角色不同)
               - name: PD_SWA_FULL_TOKENS_RATIO
-                value: "0.4"
+                value: "0.1"     # ⚠ 2026-10-03 对齐: 10-02 定论 0.1 最优 (r=0.4→full 池 -70%,
+                                 #   128 并发会触发大量 retract→abort→请求失败); launcher 显式 argv
+                                 #   直接用本 env (默认 0.1), official 模式厂商字面量也是 0.1
               # 厂商 decode.sh: --cuda-graph-bs 1..8 --cuda-graph-max-bs=8
               - name: PD_CUDA_GRAPH_MAX_BS
                 value: "8"
@@ -414,8 +416,8 @@ spec:
                 value: "1"
               - name: SGLANG_JIT_DEEPGEMM_PRECOMPILE
                 value: "0"
-              - name: SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
-                value: "1"
+              - name: SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK
+                value: "0"
               # idle 期池核算微差即 raise 并杀 scheduler → 显式关闭 strict 检查
               # (新镜像里该开关仍存在)
               - name: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE

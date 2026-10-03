@@ -344,8 +344,8 @@ spec:
                 value: "256"
               - name: SGLANG_JIT_DEEPGEMM_PRECOMPILE
                 value: "0"
-              - name: SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
-                value: "1"
+              - name: SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK
+                value: "0"
               # USE_INDEX_CACHE 已随镜像更新移除: 0.5.13-maca 镜像内已无此变量
               # (rc3 fork 专属), 设了不生效。
               - name: SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD
