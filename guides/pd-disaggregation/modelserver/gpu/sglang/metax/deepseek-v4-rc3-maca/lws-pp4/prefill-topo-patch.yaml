@@ -1,0 +1,18 @@
+# 同拓扑对照: prefill 从最优解 (pp1/tp8/dp4) 改为 HiCache 镜像原生合法拓扑
+# (pp4/tp8/dp1)。仅动这两个 env (strategic merge, 按 name 合并)。
+# tp 由厂商公式 = nnodes×num_dies/pp = 32/4 = 8 自动得出, 无需显式覆盖。
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: prefill-dsv4rc3
+spec:
+  leaderWorkerTemplate:
+    workerTemplate:
+      spec:
+        containers:
+          - name: modelserver
+            env:
+              - name: PD_PP_SIZE
+                value: "4"
+              - name: PD_DP_SIZE
+                value: "1"

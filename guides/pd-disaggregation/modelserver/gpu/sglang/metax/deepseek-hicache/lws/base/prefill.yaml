@@ -159,9 +159,11 @@ spec:
               # ⚠ 2026-09-26 验证实验: 单机 PP8/TP1 形态 (GPUStack 报告原配方,
               #   "Prefill 2.10 PP8/TP1/DP1" 单节点 8 卡) —— 验证 transfer kernel
               #   崩溃是否与 TP=8/跨节点形态相关。
-              # ⚠ hicache L3 方案标准形态: MY_PREFILL_PP_AUTO=1 自动推导
-              #   (tp=8/pp=4/dp=1, GPUStack 配方); PD_* 仅作 config.sh 回写兜底。
-              #   (2026-09-26 单机形态等价实验见 HICACHE.md §5 — 崩溃与形态无关)
+              # ⚠ 2026-10-04 同拓扑对照结论: 本镜像 (r4-hicache-l2) 官方 prefill.sh 硬约束
+              #   tp = nnodes×num_dies/pp 且 tp 必须整除 o_groups(=8) → 4 节点下唯一合法解
+              #   为 pp=4/tp=8/dp=1 (GPUStack 配方, 恢复 MY_PREFILL_PP_AUTO=1)。
+              #   dsv4rc3 最优解的 pp1/tp8/dp4 在本镜像官方路径无法表达 (pp=1 → tp=32,
+              #   触发 prefill.sh 的 log_fatal 保护; 强制 dp=4 得到非法 tp4/pp8/dp4)。
               - name: PD_TP_SIZE
                 value: "8"
               - name: PD_PP_SIZE
@@ -199,9 +201,8 @@ spec:
               #   prefetch 成功后 kernel 越界, 疑 direct IO (零拷贝) 原生栈问题。
               #   按 SGLang HiCache 最佳实践改 kernel 后端 (经 kernel 拷贝更保守)。
               - name: MY_HICACHE_IO_BACKEND
-                value: "kernel"   # ⚠ 2026-10-03 16:45 起改 kernel: direct 零拷贝 DMA 在持续负载下
-                                  #   xnack(0x8) atu address translation error (14:11 65K / 16:45 conc-64
-                                  #   两次崩溃, prefill leader)。kernel 后端经拷贝更保守 (09-26 已标注)。
+                value: "direct"   # 2026-10-04 用户指示改回 direct (文档 §3.1 官方组合;
+                                  #   两种后端均实测 xnack 崩溃 — 恢复官方配置)。
               # ⚠ 2026-09-26 CUDA_LAUNCH_BLOCKING=1 诊断结论: **不可用** ——
               #   blocking 模式下 hicache 初始化卡死 (>25min 无进展, 引擎日志停摆),
               #   且无法验证 transfer kernel 竞态假设。已回退。
@@ -225,9 +226,8 @@ spec:
               # 2026-10-03 晚: HiCache 官方博客验证组合 kernel+page_first (我们此前 layer_first)。
               - name: PD_HICACHE_MEM_LAYOUT
                 value: "page_first"
-              # 最终旋钮: write_back (默认 write_through 每请求写 host; write_back 仅淘汰时写)。
-              - name: PD_HICACHE_WRITE_POLICY
-                value: "write_back"
+              # write_back 实验已回退 (2026-10-04 00:0x): 加 write_back 后连续 boot 卡死
+              # (rendezvous 死锁), 疑似与该策略下的 host 池行为相关 — 恢复 write_through。
               - name: SGLANG_ENABLE_UNIFIED_RADIX_TREE
                 value: "1"
 

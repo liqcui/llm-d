@@ -606,6 +606,15 @@ data:
                           "${cfg%/*}/prefill.sh" "hicache-io-backend=${MY_HICACHE_IO_BACKEND}"
       fi
 
+      # 2026-10-04 同拓扑对照: 厂商 prefill 脚本在 dp>1 时缺 --enable-dp-attention
+      #   → check_server_args 断言失败 (multi-node data parallel is not supported
+      #   unless dp attention)。与 dsv4rc3 最优解一致: 补 attention + lm-head 双 flag。
+      if [ "${role}" = "prefill" ] && [ "${PD_DP_SIZE:-1}" -gt 1 ] \
+         && ! grep -q -- '--enable-dp-attention' "${mdl}"; then
+        sed -i "s|^readonly prefill_model_args=(|readonly prefill_model_args=(\n    --enable-dp-attention\n    --enable-dp-lm-head|" "${mdl}"
+        log "官方回写: models/<spec>.sh 增加 --enable-dp-attention --enable-dp-lm-head (dp>1 必需)"
+      fi
+
       # ⚠ 文档 §3.3: Dynamic Chunking + HiCache 组合路径不完整 (page 泄漏/pool 状态损坏;
       #   0.5.12 定性, 0.5.13 未验证) → 从 models/<spec>.sh 移除该 flag (官方模式
       #   PD_EXTRA_ARGS 不生效, 该 flag 由厂商脚本硬编码)。2026-10-03 xnack 崩溃的上游假设。

@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 同拓扑对照变体 (2026-10-04): dsv4rc3 以 HiCache L2 镜像的原生合法拓扑
+# (pp=4/tp=8/dp=1) 部署，用于隔离 HiCache 变量的 A/B 对照。
+#
+# 背景: r4-hicache-l2 的厂商 prefill.sh 硬约束 tp=卡数/pp 且 tp|o_groups(=8)
+#   → 4 节点下唯一合法解为 pp4/tp8/dp1；本仓库原 lws/ (最优解 pp1/tp8/dp4)
+#   保持不动, 本目录仅为其 + prefill 拓扑 patch 的对照变体。
+#
+# 用法: kubectl apply -k <本目录>   (与原 lws/ 互斥, 同一时刻只部署一个)
+# ═══════════════════════════════════════════════════════════════════════════
+
+namespace: metax-ai-pd
+
+resources:
+  - ../lws
+
+patches:
+  - path: prefill-topo-patch.yaml
+    target:
+      kind: LeaderWorkerSet
+      name: prefill-dsv4rc3
