@@ -10,7 +10,7 @@
 |---|---|---|
 | LMCache 本体 × 沐曦 GPU | ✅ 官方支持 | MXMACA 合入 LMCache 主线（PR #4606，2026-09）；`setup_extensions/build_profiles/maca.py` 一等公民 |
 | 厂商 SGLang fork 的 `--enable-lmcache` 集成代码 | ✅ 完整（0.5.13/0.5.14 均有） | 镜像内 `srt/mem_cache/storage/lmcache/`（LMCRadixCache，读 `lmcache.integration.sglang.*`） |
-| 镜像内 lmcache 包 | ✅ 本目录补齐（**2026-10-06 实测闭环**） | `image/`：MACA 编译 ✓ → fork 三件套 adapter 导入 ✓ → `lmcache server` daemon 实起 LISTEN ✓ |
+| 镜像内 lmcache 包 | ✅ 本目录补齐（**2026-10-06 实测闭环**） | `image/`：MACA 编译 ✓ → fork 三件套 adapter 导入 ✓ → `lmcache server` daemon 实起 LISTEN ✓ → **镜像已构建并推送 harbor**（digest `46a98639…`） |
 | MP daemon + 部署骨架 | ✅ 已就绪（kustomize 渲染验证 ✓） | `daemon/` DaemonSet + `base/lmcache-config.yaml` + launcher 预埋注入 |
 | **引擎侧对 DSv4 启用** | ⛔ **结构性门禁未解锁** | registry 选择顺序（§3）；上游修复 PR 未进厂商镜像 |
 | 解锁成本 | 一行 env | `PD_ENABLE_LMCACHE=1`（launcher 已预埋注入逻辑） |

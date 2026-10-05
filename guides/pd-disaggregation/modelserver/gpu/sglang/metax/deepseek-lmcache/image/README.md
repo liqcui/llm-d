@@ -12,6 +12,8 @@ BASE_IMAGE=<r5 镜像> bash build.sh   # 厂商 rebase 后切换基座（解锁�
 ```
 
 - 产物：`harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2-pp1-lmcache`
+  **已构建并推送**（2026-10-06；digest `sha256:46a986399019e71addd7e5badfab93108ff58360cee825d27680d84f2d0026c6`；
+  本机 image id `692fabae4b67`，32.9GB；部署时节点可直接拉取）
 - 源码：PyPI sdist 固定 **LMCache 0.5.5**（`LMCACHE_VERSION=...` 可换；build.sh 自动下载并随目录缓存）
 - ⚠ 本机镜像构建一律用 **docker**（podman 3.4.4 有 OCI↔Docker manifest 转换 bug）。
 

@@ -51,13 +51,16 @@ RUN pip install --no-input --no-deps /tmp/wheel/lmcache-*.whl \
  && rm -rf /tmp/wheel /root/.cache/pip
 
 # 3) 构建产物冒烟（ADR: 镜像即验证; 失败则 build 直接红）——三层验证:
-#    fork 三件套 adapter 导入 / cuda_ops 扩展落地 / 完整版 server CLI（--l1-size-gb 等必填参数）
+#    fork 三件套 adapter / cuda_ops（经包机制的 device_ops 路径）/ 完整版 server CLI
 RUN python3 - <<'EOF'
 import lmcache
 from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
 from lmcache.integration.sglang.sglang_adapter import LMCacheLayerwiseConnector
 from lmcache.integration.sglang.utils import lmcache_get_config
 print("lmcache", lmcache.__version__, "| sglang 三件套 adapter OK")
+# cuda_ops 必须经包机制加载（直导会 undefined symbol: PhaseTimer——兄弟扩展符号序）;
+# 无卡环境走 StubCPUDevice 属预期, 真实节点自动检测 MACA 设备
+from lmcache.v1.platform.cuda import device_ops
+print("cuda_ops 加载 OK:", device_ops.__name__)
 EOF
-RUN python3 -c "import lmcache.cuda_ops as o; print('cuda_ops OK')" || echo "cuda_ops 缺 GPU 上下文（构建机无卡属预期）"
 RUN lmcache server --help 2>/dev/null | grep -q -- '--l1-size-gb' && echo "完整版 server CLI OK"
