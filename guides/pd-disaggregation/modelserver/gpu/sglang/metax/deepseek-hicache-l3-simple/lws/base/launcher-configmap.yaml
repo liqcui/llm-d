@@ -566,6 +566,14 @@ data:
       if [ "${role}" = "prefill" ]; then
         _override_var "prefill_pp_size_default" "${PD_PP_SIZE:-}" "${mdl}"
       fi
+      # dp>1 (最优解拓扑 pp1/tp8/dp4): 厂商 prefill 脚本缺 --enable-dp-attention →
+      #   check_server_args 断言 "multi-node data parallel is not supported unless
+      #   dp attention!" 失败 (2026-10-05 L3 启动复现, 同 L2-PP1 修复)。
+      if [ "${role}" = "prefill" ] && [ "${PD_DP_SIZE:-1}" -gt 1 ] \
+         && ! grep -q -- '--enable-dp-attention' "${mdl}"; then
+        sed -i "s|^readonly prefill_model_args=(|readonly prefill_model_args=(\n    --enable-dp-attention\n    --enable-dp-lm-head|" "${mdl}"
+        log "官方回写: models/<spec>.sh 增加 --enable-dp-attention --enable-dp-lm-head (dp>1 必需)"
+      fi
       if [ "${role}" = "decode" ]; then
         _override_var "decode_ep_size" "${PD_EP_SIZE:-}" "${cfg}"
       fi
