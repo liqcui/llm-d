@@ -573,6 +573,12 @@ data:
       _override_var "${role}_tp_size" "${PD_TP_SIZE:-}" "${cfg}"
       _override_var "${role}_dp_size" "${PD_DP_SIZE:-}" "${cfg}"
       _override_var "${role}_pp_size" "${PD_PP_SIZE:-}" "${cfg}"
+      # ⚠ 0.5.13 血统 (r4-hicache): prefill.sh 非 auto 路径读 **prefill_pp_size_default**
+      #   (models/<spec>.sh 定义, 默认 8), 而非 config.sh 的 prefill_pp_size ——
+      #   必须显式回写, 否则 PD_PP_SIZE 无效 (2026-10-05 L2-PP1 启动崩: pp8×tp8=64 卡需求)。
+      if [ "${role}" = "prefill" ]; then
+        _override_var "prefill_pp_size_default" "${PD_PP_SIZE:-}" "${mdl}"
+      fi
       if [ "${role}" = "decode" ]; then
         _override_var "decode_ep_size" "${PD_EP_SIZE:-}" "${cfg}"
       fi
