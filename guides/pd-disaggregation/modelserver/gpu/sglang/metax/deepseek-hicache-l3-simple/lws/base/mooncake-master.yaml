@@ -17,14 +17,19 @@ spec:
   hostNetwork: true
   containers:
     - name: master
-      image: harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2-mc013
+      image: harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2-pp1
+      # ⚠ 2026-10-05: master 必须与引擎 client 同版本 —— 简化版引擎是 l2-pp1 镜像
+      #   (mooncake 0.3.6 binding), master 若用 mc013 (0.3.13) 会 `invalid rpc arg`
+      #   → mount_segment_to_master_failed → Failed to setup Mooncake store -900。
+      #   (Dummy Client 版无此问题: 引擎经 SHM→store(0.3.13), master 同为 mc013。)
       imagePullPolicy: Always
       command: ["/bin/bash", "-c"]
       args:
         - |
           export LD_LIBRARY_PATH=/opt/conda/lib:${LD_LIBRARY_PATH:-}
-          # 0.3.13 (mc013 镜像, /usr/local/bin; 与 Real Client 同版本)
-          exec /usr/local/bin/mooncake_master \
+          # 0.3.6 (l2-pp1 镜像, /opt/conda/bin — 与引擎 client 同版本; mc013 的
+          # /usr/local/bin 新版在此镜像不存在)
+          exec /opt/conda/bin/mooncake_master \
             --rpc_address=0.0.0.0 \
             --rpc_port=50051 \
             --enable_http_metadata_server=true \
