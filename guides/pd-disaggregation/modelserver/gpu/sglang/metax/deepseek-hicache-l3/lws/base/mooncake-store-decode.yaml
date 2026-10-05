@@ -5,7 +5,10 @@
 #   - local_buffer_size=0: 仅作 Store Server, 不发起 Get/Put
 #   - 配置走 JSON (镜像内 mooncake_config.py 必须 MOONCAKE_CONFIG_PATH 指向文件;
 #     报告 §16.2 同款 --config= 形式)
-# 部署在 decode 节点 mxgpu-3-34 (hostNetwork; 端口 8081 不与 decode 8200/8998 冲突)
+# 部署在 decode 节点 mxgpu-3-34 (hostNetwork; 端口 8085 不与 decode 8200/8998 冲突)
+# ⚠ 2026-10-05 端口 8081→8085: node34/35 的 8081 已被 nginx 占用 (其他服务), 启动
+#   "address already in use" 崩溃循环。8085 空闲; 无组件依赖本 HTTP 端口
+#   (SGLang 引擎经 MOONCAKE_CLIENT=127.0.0.1:50052 RPC 连接)。
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -50,7 +53,7 @@ spec:
       args:
         - |
           export LD_LIBRARY_PATH=/opt/conda/lib:${LD_LIBRARY_PATH:-}
-          exec python3 -m mooncake.mooncake_store_service --port=8081
+          exec python3 -m mooncake.mooncake_store_service --port=8085
       env:
         - name: MOONCAKE_CONFIG_PATH
           value: /etc/mooncake/config.json

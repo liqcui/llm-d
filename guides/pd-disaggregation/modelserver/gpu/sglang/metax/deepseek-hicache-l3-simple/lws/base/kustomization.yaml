@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 简化版 L3 (2026-10-05, 对齐官方 Quickstart): 无 Dummy Client 架构 ——
+#   去掉 mooncake-store-decode / mooncake-client DaemonSet;
+#   prefill 引擎直连 mooncake master (MOONCAKE_GLOBAL_SEGMENT_SIZE 非零, 自行贡献
+#   内存段; 官方: "如果设置为非零值, 可以跳过启动 store service")。
+resources:
+  - prefill.yaml
+  - decode.yaml
+  - router.yaml
+  - services.yaml
+  - serviceAccount.yaml
+  - launcher-configmap.yaml
+  - rbac.yaml
+  - mooncake-master.yaml

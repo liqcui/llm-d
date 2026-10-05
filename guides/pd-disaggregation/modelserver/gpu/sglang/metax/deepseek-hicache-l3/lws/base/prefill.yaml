@@ -69,7 +69,7 @@ spec:
 
         containers:
           - name: modelserver
-            image: harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2-mc013
+            image: harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2-mc013-pp1
             imagePullPolicy: Always
             workingDir: /workspace
             command:
@@ -155,17 +155,18 @@ spec:
               # ⚠ 2026-09-26 验证实验: 单机 PP8/TP1 形态 (GPUStack 报告原配方,
               #   "Prefill 2.10 PP8/TP1/DP1" 单节点 8 卡) —— 验证 transfer kernel
               #   崩溃是否与 TP=8/跨节点形态相关。
-              # ⚠ hicache L3 方案标准形态: MY_PREFILL_PP_AUTO=1 自动推导
-              #   (tp=8/pp=4/dp=1, GPUStack 配方); PD_* 仅作 config.sh 回写兜底。
-              #   (2026-09-26 单机形态等价实验见 HICACHE.md §5 — 崩溃与形态无关)
+              # ⚠ 2026-10-05 L3-PP1: 用 **mc013-pp1 补丁镜像** (prefill.sh tp 优先取
+              #   prefill_tp_size), 使**最优解拓扑 pp1/tp8/dp4** 可表达 (与生产最优解
+              #   deepseek-v4-rc3-maca/lws 及 L2-PP1 严格同拓扑)。原 mc013 受
+              #   tp=卡数/pp 且 tp|o_groups 硬约束只能 pp4/tp8/dp1。
               - name: PD_TP_SIZE
                 value: "8"
               - name: PD_PP_SIZE
                 value: "1"
               - name: PD_DP_SIZE
-                value: "1"
+                value: "4"
               - name: MY_PREFILL_PP_AUTO
-                value: "1"
+                value: "0"
 
               # ── 显存 / 上下文 / chunk: 回写 config.sh + models/<spec>.sh ──
               # 厂商 prefill 侧 mem fraction 是硬编码函数, 恒为 0.82
