@@ -1,0 +1,6 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# LMCache MP daemon: 每 prefill 节点一个 host-memory KV 池（DaemonSet）
+resources:
+  - lmcache-server-daemonset.yaml

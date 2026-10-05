@@ -1,0 +1,38 @@
+# LMCache 配置（引擎与 MP daemon 共用; fork README 的 MP 模式协议）
+#
+# 引擎侧: --enable-lmcache --lmcache-config-file /workspace/lmcache/lmcache.yaml
+#          （PD_ENABLE_LMCACHE=1 时由 launcher 注入, 见 launcher-configmap.yaml）
+# daemon : lmcache server 的命令行参数必须与本文件 mp_host/mp_port/chunk_size 一致
+#          （见 ../daemon/lmcache-server-daemonset.yaml）
+#
+# ⚠ 就绪状态（2026-10-06）: 引擎侧对 DSv4(hybrid SWA) 门禁未解锁前, 本配置仅对
+#   daemon 生效（daemon 可独立起、可连、可冒烟）; 解锁后引擎即按本配置接入。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lmcache-config
+  labels:
+    llm-d.ai/role: lmcache
+    llm-d.ai/guide: pd-disaggregation
+data:
+  lmcache.yaml: |
+    # ── MP 模式（多进程 daemon; 对齐 fork: sglang/srt/mem_cache/storage/lmcache/README.md）──
+    # hostNetwork 部署 ⇒ 引擎与 daemon 同节点, 走回环。
+    mp_host: 127.0.0.1
+    mp_port: 5556
+
+    # ── 存储层 ──
+    # chunk_size 必须与 sglang 的 page_size 对齐（本部署 server_args page_size=256,
+    # 如 dsv4 backend 自行调整则解锁时以引擎日志为准核对）。chunk 越小命中粒度越细、
+    # 元数据越多; 256 与 page 对齐是最保守的选择。
+    chunk_size: 256
+
+    # L1 = daemon 持有的 host memory 池（daemon 以 --l1-size-gb 传入, 此处注释备忘;
+    #   引擎侧不直接读该值）。节点 2TB RAM, 池给 400GB 与文章基准一致。
+    # l1_size_gb: 400
+    eviction_policy: LRU
+
+    # ── 可选（解锁调优时打开; 默认注释以保持与 fork 示例最小差异）──
+    # local_disk: /var/log/lmcache-disk        # L2 本地 SSD（跨节点前的本机持久层）
+    # redis_url: redis://127.0.0.1:6379        # 远端共享层（如需要跨 prefill 节点复用）
+    # remote_url: mooncake://...               # 远端（⚠ MACA L3 写回有平台故障史, 慎开）

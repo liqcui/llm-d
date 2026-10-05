@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - prefill.yaml
+  - decode.yaml
+  - router.yaml
+  - services.yaml
+  - serviceAccount.yaml
+  - launcher-configmap.yaml
+  - lmcache-config.yaml
+  - rbac.yaml
+  # LMCache 变体: 无 HiCache L2 / 无 mooncake store —— 缓存层由
+  #   lmcache MP daemon 承担（../daemon/）; 引擎侧启用待解锁（见 ../README.md）

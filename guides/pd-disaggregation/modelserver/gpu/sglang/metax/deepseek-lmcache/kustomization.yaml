@@ -1,0 +1,62 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 沐曦 (MetaX) SGLang PD 分离 — DeepSeek-V4-Flash + **LMCache（MP 模式）** 变体
+#
+# 定位（2026-10-06 就绪资产型）:
+#   引擎与"最优解拓扑"严格同构（prefill pp1/tp8/dp4; decode 侧保持 0.5.12 修复
+#   镜像不变——LMCache 在 prefill 侧生效）, 缓存层改由 LMCache MP daemon 承担
+#   （替换 HiCache L2; 两者互斥）。引擎侧 --enable-lmcache 当前对 DSv4(hybrid SWA)
+#   被厂商镜像 registry 门禁阻塞 → 本目录先把**镜像/daemon/部署骨架**全部就绪,
+#   解锁 = 置 PD_ENABLE_LMCACHE=1（详见 README「解锁路线图」）。
+#
+# ⚠️ 独立部署: 与 GLM (metax/lws/)、deepseek-v4-rc3-maca、deepseek-hicache-* 完全
+#             分离; 使用独立节点标签 metax-sglang-pd-*-lmcache（与 hicache 标签互斥）。
+#
+# 拓扑 (每角色 1 个 4 节点逻辑实例, 共 8 节点 64 卡):
+#   Prefill LWS: replicas=1 size=4 → 4 pods / 4 节点 / 32 卡  (tp=8 dp=4 ep=8, HTTP :8000)
+#   Decode  LWS: replicas=1 size=4 → 4 pods / 4 节点 / 32 卡  (tp=8 dp=4 ep=8, :8200)
+#                每 decode pod 带 routing-proxy sidecar (:8000, kv-connector=sglang)
+#   LMCache daemon (DaemonSet): 每 prefill 节点 1 个, host-memory 池 400GB, :5556
+#   访问链路:   Client → EPP → decode sidecar:8000 → prefill:8000 / decode modelserver:8200
+#               Client → sglang router:8001 (对比网关, 同一后端)
+#
+# 部署前:
+#   1. LWS CRD 已装 (leaderworkerset.x-k8s.io/v1)
+#   2. 模型: 全部 8 个候选节点宿主机 /data/DeepSeek-V4-Flash-FlexSMQ-AWQ-W8A8 存在 (hostPath)
+#   3. 节点标签 (hostNetwork 端口冲突, 各角色节点互斥; size=4 需每角色 ≥4 台):
+#        prefill ×4: kubectl label node <node> metax-sglang-pd-prefill-lmcache=true --overwrite
+#        decode  ×4: kubectl label node <node> metax-sglang-pd-decode-lmcache=true  --overwrite
+#        router  ×1: kubectl label node <node> metax-sglang-pd-router-lmcache=true  --overwrite
+#   4. LMCache 镜像: 先按 image/README.md 构建并推送 -lmcache tag
+#   5. RDMA: 节点 mlx5_0/mlx5_1 应为 IB ACTIVE; manage0 为管理网口
+#   6. InferencePool pd-disaggregation (Helm 管理) selector 匹配
+#      llm-d.ai/guide=pd-disaggregation + leaderworkerset.sigs.k8s.io/worker-index="0",
+#      targetPort 8000
+#   7. 用 sglang router 对比网关时, 需在 base/router.yaml 填 PD_PREFILL_ENDPOINTS /
+#      PD_DECODE_ENDPOINTS (各 master pod 的 <ip>:<port>)
+#
+# 参数调整: 只改 base/prefill.yaml 与 base/decode.yaml 的 env: 块。
+#   启动模式由 PD_LAUNCH_MODE 选择 (official=跑镜像内官方脚本, 默认)。
+
+namespace: metax-ai-pd
+
+resources:
+  - base
+  - daemon
+
+# 镜像集中覆盖: 换仓库/换 tag 只改这里
+images:
+  # ⚠ decode 侧沿用 0.5.12 修复镜像 (与 L2 对照一致; decode 不变, 唯一变量=prefill 侧);
+  #   prefill.yaml 内硬编码 -lmcache 镜像（模型服务镜像仅 prefill 变更）。
+  # ⚠ 2026-09-26 迁移到 MACA 3.8.2.7 镜像 (用户指定):
+  #   0.5.12-maca.ai3.8.2.7-llm = 3.8.2.7 基础镜像 + 从 0.5.12-dsv4-c500-llm 迁移
+  #   llm-launch(含全部补丁) + eplb 文件 + apt 补装 iproute2/jq/curl。
+  - name: REPLACE_MODEL_SERVER_IMAGE
+    newName: harbor.isuanova.com/metax/sglang
+    newTag: 0.5.12-maca.ai3.8.2.7-torch2.10-py312-ubuntu22.04-amd64-llm
+  - name: REPLACE_ROUTING_SIDECAR_IMAGE
+    # 离线环境: 侧车镜像来自集群内 registry (节点 /etc/hosts 将
+    # registry.cubestack.io 指向内网 registry, containerd 走 HTTP 拉取)。
+    newName: registry.cubestack.io:5000/llm-d/llm-d-router-disagg-sidecar
+    newTag: v0.9.0

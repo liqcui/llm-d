@@ -1,0 +1,105 @@
+# LMCache MP daemon（DaemonSet）— 每 prefill 节点一个独立 host-memory KV 池
+#
+# 为什么 DaemonSet 而非 sidecar:
+#   · MP 模式的卖点 = daemon 独立于引擎存活 —— 引擎组重建（LWS RecreateGroup）
+#     期间 KV 池不丢, 重建后新引擎直接命中旧池（HiCache L2 做不到: 池在引擎进程内）。
+#   · 节点 = 池的映射简单清晰（hostNetwork + 回环), 与 prefill LWS 的
+#     "1 pod/节点" 布局一一对应。
+#
+# 通道: hostNetwork: true ⇒ 引擎（同为 hostNetwork）经 127.0.0.1:5556 直连本节点 daemon。
+# 容量: 节点 2TB RAM; 池 400GB（对齐 LMCache 官方基准规模）, 其余留引擎/页缓存。
+# ⚠ 5556 需避免与节点既有服务冲突（部署检查清单见 ../README.md §5）。
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: lmcache-server
+  labels:
+    llm-d.ai/role: lmcache
+    llm-d.ai/guide: pd-disaggregation
+spec:
+  selector:
+    matchLabels:
+      llm-d.ai/role: lmcache-server
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        llm-d.ai/role: lmcache-server
+        llm-d.ai/guide: pd-disaggregation
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        metax-sglang-pd-prefill-lmcache: "true"
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        supplementalGroups: [44]
+      # 引擎组重建不影响 daemon; 一个节点故障只损失本节点池
+      tolerations: []
+      containers:
+        - name: lmcache-server
+          image: harbor.isuanova.com/metax/sglang:0.5.13-dsv4-adapter-r4-hicache-l2-pp1-lmcache
+          imagePullPolicy: Always
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              # 与 base/lmcache-config.yaml 的 mp_port/chunk_size 保持一致
+              # ⚠ 0.5.5 CLI: --l1-size-gb 与 --eviction-policy 为**必填**;
+              #   --transport zmq 对齐 fork 的 MP 模式（LMCacheMPConnector）
+              exec lmcache server \
+                --host 127.0.0.1 \
+                --port ${LMCACHE_MP_PORT} \
+                --chunk-size ${LMCACHE_CHUNK_SIZE} \
+                --l1-size-gb ${LMCACHE_L1_GB} \
+                --eviction-policy LRU \
+                --transport zmq
+          env:
+            - name: LMCACHE_MP_PORT
+              value: "5556"
+            - name: LMCACHE_CHUNK_SIZE
+              value: "256"
+            - name: LMCACHE_L1_GB
+              value: "400"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # MACA 运行时（daemon 若导入 torch/cupy 需要; 纯 host 内存路径不碰 GPU）
+            - name: MACA_PATH
+              value: "/opt/maca"
+            - name: CUDA_PATH
+              value: "/opt/maca/tools/cu-bridge"
+          ports:
+            - name: lmcache-mp
+              containerPort: 5556
+              protocol: TCP
+          resources:
+            limits:   { memory: "480Gi", cpu: "16" }
+            requests: { memory: "32Gi", cpu: "4" }
+          volumeMounts:
+            - name: mxdriver
+              mountPath: /opt/mxdriver
+              readOnly: true
+            - name: mxcd
+              mountPath: /dev/mxcd
+            - name: dshm
+              mountPath: /dev/shm
+          startupProbe:
+            tcpSocket: { port: lmcache-mp }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket: { port: lmcache-mp }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: mxdriver
+          hostPath: { path: /opt/mxdriver, type: DirectoryOrCreate }
+        - name: mxcd
+          hostPath: { path: /dev/mxcd, type: CharDevice }
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }
