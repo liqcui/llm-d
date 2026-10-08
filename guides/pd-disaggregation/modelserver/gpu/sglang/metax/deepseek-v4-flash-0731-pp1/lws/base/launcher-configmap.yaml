@@ -38,6 +38,10 @@
 # PD_DIST_INIT_PORT          默认 5000
 # PD_DISAGG_IB_DEVICE        默认 mlx5_0
 # PD_EXTRA_ARGS              自由追加 argv
+# PD_ENABLE_HICACHE          (prefill) 1=开 HiCache L2 (Host 内存层) — 默认 0
+# PD_HICACHE_RATIO           默认 0.5 (0.5.13 L2-PP1 标定组合)
+# PD_HICACHE_MEM_LAYOUT      默认 page_first (官方博客验证组合)
+# PD_HICACHE_IO_BACKEND      默认 direct (官方组合; kernel 备选)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -218,6 +222,20 @@ data:
     # dp>1 必须 dp-attention
     if [ "${PD_DP_SIZE:-4}" -gt 1 ]; then
       ARGS+=( --dp-size "${PD_DP_SIZE:-4}" --enable-dp-attention --enable-dp-lm-head )
+    fi
+
+    # prefill 专属: HiCache L2 (Host 内存层; 参数对齐 0.5.13 L2-PP1 标定组合)
+    # 必须伴生 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1: DSv4 混合 attention 不被原生
+    # HiRadixCache 支持 (hiradix_cache.py: only supports MHA/MLA/DSA), 需走
+    # UnifiedRadixCache (mem_cache/registry.py) 才支持 full+swa 混合池。
+    if [ "${PD_ROLE}" = "prefill" ] && [ "${PD_ENABLE_HICACHE:-0}" = "1" ]; then
+      export SGLANG_ENABLE_UNIFIED_RADIX_TREE=1
+      ARGS+=(
+        --enable-hierarchical-cache
+        --hicache-ratio "${PD_HICACHE_RATIO:-0.5}"
+        --hicache-mem-layout "${PD_HICACHE_MEM_LAYOUT:-page_first}"
+        --hicache-io-backend "${PD_HICACHE_IO_BACKEND:-direct}"
+      )
     fi
 
     # decode 专属: DSPARK 投机解码 + CUDA graph

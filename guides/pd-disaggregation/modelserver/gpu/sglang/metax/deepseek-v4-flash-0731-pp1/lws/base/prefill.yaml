@@ -111,6 +111,17 @@ spec:
                 value: "16384"
               - name: PD_MAX_RUNNING_REQUESTS
                 value: "40"          # 10-08 调优标定 (与 decode 同步阶梯；40 档零 abort)
+              # ── HiCache L2 (Host 内存层; prefill 专属开关) ──
+              #   1=开 --enable-hierarchical-cache + 伴生 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1
+              #   (DSv4 混合 attention 需 UnifiedRadixCache); 参数=0.5.13 L2-PP1 标定组合
+              - name: PD_ENABLE_HICACHE
+                value: "0"
+              - name: PD_HICACHE_RATIO
+                value: "0.5"
+              - name: PD_HICACHE_MEM_LAYOUT
+                value: "page_first"
+              - name: PD_HICACHE_IO_BACKEND
+                value: "direct"
               - name: PD_PAGE_SIZE
                 value: "64"
               - name: PD_KV_CACHE_DTYPE

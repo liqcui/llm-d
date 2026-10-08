@@ -12,6 +12,14 @@ retract→offload→混合 SWA 池 `NotImplementedError` 整组崩溃（与 0.5.
 `docs/TEST-REPORT-2026-10-08-dsv4-0731-first-battery.md`。单机 207 tok/s@8并发 (DSPARK accept 0.18)，
 PD 150.6 tok/s@8并发。`image/` 下 modelslim 旧补丁仅适用于旧格式模型，保留备查
 
+**2026-10-09 凌晨 HiCache L2（prefill-only）接入**：launcher 新增 `PD_ENABLE_HICACHE` 开关
+（=1 时注入 hicache flag + 自动伴生 `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1`——DSv4 混合
+attention 必需）；标定组合 ratio 0.5 / page_first / direct（引擎改写为 page_first_direct）。
+测试结论：随机 prompt 无效应（±噪声）；**多轮复用场景稳态温和收益（~10-30%）**；建议按业务
+场景切换（单 env + prefill 单次滚动 ~6min）。详见 sglbench 报告
+`docs/TEST-REPORT-2026-10-08-hicache-l2-0731.md`（含测量学修正：早期轮次尖峰为 JIT/热身伪影，
+非 L2 效应）
+
 ---
 
 ## 1. 方案概览
@@ -98,6 +106,8 @@ kubectl -n metax-ai-pd get pods -o wide | grep dsv4-0731
 | `PD_CONTEXT_LENGTH` | 上下文长度 | 400000 |
 | `PD_MAX_RUNNING_REQUESTS` | 最大运行请求 | 40（10-08 标定：conc-64 660→1901 tok/s；80 回退 -18.9%） |
 | `PD_CUDA_GRAPH_MAX_BS` | decode CUDA graph 上限（引擎内部压回 ≤10） | 40 |
+| `PD_ENABLE_HICACHE` | prefill HiCache L2 开关（伴生 unified radix tree 自动注入） | 0（多轮复用场景可设 1） |
+| `PD_HICACHE_RATIO` / `PD_HICACHE_MEM_LAYOUT` / `PD_HICACHE_IO_BACKEND` | L2 标定组合 | 0.5 / page_first / direct |
 | `PD_CHUNKED_PREFILL_SIZE` | prefill 分块 | 16384 |
 | `PD_PAGE_SIZE` | KV 页大小 | 64 |
 | `PD_KV_CACHE_DTYPE` | KV 缓存精度 | bfloat16 |
