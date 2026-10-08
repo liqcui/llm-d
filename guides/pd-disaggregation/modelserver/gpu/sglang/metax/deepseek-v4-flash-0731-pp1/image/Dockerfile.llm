@@ -1,0 +1,31 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 0731 官方 llm-launch 镜像: dsv4-0731 修复镜像 + 官方 llm-launch 脚本 (0.5.14+DSPARK 适配)
+#
+# 基础: harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731
+#       (0.5.14 官方镜像 + ModelSlim/W8A8 模型加载修复, 见同目录 Dockerfile)
+# 增加: /workspace/llm-launch (从 0.5.13-dsv4-adapter-r4 血缘镜像提取)
+#       + apply_0731_llm_launch_patch.py (v0.5.14 gate + DSPARK 分支 + 0731 model spec)
+#
+# 构建:
+#   docker build -f Dockerfile.llm -t harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-llm .
+#   docker push harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-llm
+# ═══════════════════════════════════════════════════════════════════════════
+FROM harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731
+
+# 官方 llm-launch common.sh 前置检查要求 ip (iproute2); 0.5.14-maca 基础镜像不含
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iproute2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && ip -V
+
+COPY llm-launch/ /tmp/llm-launch-src/
+COPY apply_0731_llm_launch_patch.py /tmp/apply_0731_llm_launch_patch.py
+RUN cp -r /tmp/llm-launch-src/. /workspace/llm-launch/ \
+ && /opt/conda/bin/python3 /tmp/apply_0731_llm_launch_patch.py \
+ && /opt/conda/bin/python3 /tmp/apply_0731_llm_launch_patch.py --check \
+ && grep -q "v0.5.14" /workspace/llm-launch/sglang/common.sh \
+ && grep -q "DSPARK" /workspace/llm-launch/sglang/decode.sh \
+ && grep -q "PATCH-0731" /workspace/llm-launch/sglang/models/deepseek-v4-flash-0731.sh \
+ && for f in common.sh config.sh decode.sh prefill.sh models/deepseek-v4-flash-0731.sh; do bash -n "/workspace/llm-launch/sglang/$f" || exit 1; done \
+ && echo "[Dockerfile.llm] llm-launch 0731 适配验证通过" \
+ && rm -rf /tmp/llm-launch-src /tmp/apply_0731_llm_launch_patch.py

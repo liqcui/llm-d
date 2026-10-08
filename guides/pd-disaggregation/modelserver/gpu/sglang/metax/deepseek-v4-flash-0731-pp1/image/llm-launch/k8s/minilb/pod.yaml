@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: group-1-minilb
+  namespace: deepseek-pd # 替换为您的命名空间
+spec:
+  hostNetwork: true
+  nodeSelector:
+    pd-minilb: group-1
+  tolerations:
+  - key: node-role.alibabacloud.com/bmcp
+    operator: Exists
+    effect: NoSchedule
+  containers:
+  - name: group-1-minilb
+    securityContext:
+      privileged: true
+      runAsGroup: 44
+      seccompProfile:
+        type: Unconfined
+      allowPrivilegeEscalation: true
+      capabilities:
+        add:
+        - ALL
+    image: 10.200.119.83:5000/sglang:maca-250822-deepep-250917-mcoplib-0923-stepmesh-0.0.1.dev0
+    env:
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: NODE_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    command:
+    - /bin/bash
+    - /mnt/nfs/sglang-k8s/startup.sh
+    - minilb
+    ports:
+    - containerPort: 8001
+    resources:
+      requests:
+        memory: 32Gi
+        cpu: '32'
+      limits:
+        memory: 32Gi
+        cpu: '32'
+    # 挂载点配置
+    volumeMounts:
+    - name: volume-dataset
+      mountPath: /mnt/storage
+    - name: nfs-workspace
+      mountPath: /mnt/nfs
+    - name: ib-nic
+      mountPath: /dev/infiniband
+  volumes:
+  - name: volume-dataset # 定义 hostPath 卷
+    hostPath:
+      path: /bgfs
+      type: Directory # 确保目录存在
+  - name: nfs-workspace
+    persistentVolumeClaim:
+      claimName: nfs-pvc
+  - name: ib-nic
+    hostPath:
+      path: /dev/infiniband

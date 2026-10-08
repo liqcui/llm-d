@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: group-1-decode
+  namespace: deepseek-pd
+spec:
+  clusterIP: None
+  selector:
+    app: group-1-decode-worker
+  ports:
+  - port: 5000
+    name: group-1-decode-master
+  - port: 8998
+    name: prdecodeefill-bootstrap

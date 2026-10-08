@@ -1,0 +1,260 @@
+# PD Launcher — DeepSeek-V4-Flash-0731 (0.5.14 官方镜像 + LLMC W8A8 新模型) 直启启动器
+#
+# ══════════════════════════════════════════════════════════════════════
+# 模式: explicit (非官方脚本直启) — 参数 1:1 对齐用户在官方镜像上验证的启动命令。
+# 新模型 (LLMC SmoothQuant W8A8, DeepSeek-V4-Flash-0731-W8A8) 被 0.5.14 官方
+# 镜像原生支持 (无 modelslim description, 无需任何补丁) — 单机实测 DSPARK
+# accept ~0.18, 单流 ~86-90 tok/s, 并发8 聚合 ~207 tok/s。
+#
+# 用户给定参数 (本层全部透传, env 可覆盖):
+#   --model-path /workspace/data/DeepSeek-V4-Flash-0731-W8A8
+#   --tp 8 --trust-remote-code --context-length 400000 --max-running-requests 10
+#   --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4
+#   --served-model-name DeepSeek-V4-Flash
+#   --speculative-algorithm DSPARK --speculative-dspark-block-size 6
+#   --chunked-prefill-size 16384 --page-size 64 --kv-cache-dtype bfloat16
+#   --schedule-conservativeness 0.6
+# 用户给定 env (pod env 块注入): PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM=1
+#   MACA_SMALL_PAGESIZE_ENABLE=1 CUDA_GRAPH_DP_USE_SUM_BS=False
+#   SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 SGLANG_DSPARK_KERNEL_COMMIT_KV_PROJ=torch
+# ══════════════════════════════════════════════════════════════════════
+#
+# === 环境变量 ===
+# PD_ROLE                    (必填) prefill | decode
+# PD_MASTER_IP               (可选) 解析不到 LWS leader 时的回退 master IP
+# PD_DRY_RUN                 (可选) 非空只打印 argv 不拉起
+# PD_MODEL_PATH              默认 /workspace/data/DeepSeek-V4-Flash-0731-W8A8
+# PD_TP_SIZE / PD_DP_SIZE / PD_PP_SIZE   默认 8 / 4 / 1
+# PD_CONTEXT_LENGTH          默认 400000
+# PD_MAX_RUNNING_REQUESTS    默认 10
+# PD_CHUNKED_PREFILL_SIZE    默认 16384
+# PD_PAGE_SIZE               默认 64
+# PD_KV_CACHE_DTYPE          默认 bfloat16
+# PD_SCHEDULE_CONSERVATIVENESS 默认 0.6
+# PD_DSPARK_BLOCK_SIZE       默认 6 (decode 侧)
+# PD_MEM_FRACTION_STATIC     prefill 默认 0.82 / decode 默认 0.75
+# PD_HTTP_PORT               prefill 8000 / decode 8200
+# PD_BOOTSTRAP_PORT          默认 8998
+# PD_DIST_INIT_PORT          默认 5000
+# PD_DISAGG_IB_DEVICE        默认 mlx5_0
+# PD_EXTRA_ARGS              自由追加 argv
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pd-launcher-dsv4-0731
+  labels:
+    llm-d.ai/guide: pd-disaggregation
+data:
+  pd-launcher.sh: |
+    #!/bin/bash
+    # pd-launcher.sh — DeepSeek-V4-Flash-0731 (0.5.14 官方镜像) PD 分离直启启动器
+    set -euo pipefail
+
+    log()  { echo "[pd-launcher] $*"; }
+    warn() { echo "[pd-launcher][WARN] $*"; }
+    die()  { echo "[pd-launcher][ERROR] $*" >&2; exit 1; }
+
+    # ==========================================================
+    # 0. 角色校验
+    # ==========================================================
+    case "${PD_ROLE:-}" in
+      prefill|decode) ;;
+      *) die "PD_ROLE 必须为 prefill 或 decode (当前: '${PD_ROLE:-<未设置>}')" ;;
+    esac
+
+    # ==========================================================
+    # 0.5 解释器探测 (sglang 装在 conda 环境)
+    # ==========================================================
+    _resolve_python_bin() {
+      if [ -n "${PD_PYTHON_BIN:-}" ] && [ -x "${PD_PYTHON_BIN}" ]; then
+        printf '%s' "${PD_PYTHON_BIN}"; return 0
+      fi
+      local c
+      for c in /opt/conda/bin/python3 /opt/conda/bin/python /usr/bin/python3; do
+        if [ -x "$c" ] && "$c" -c 'import sglang' >/dev/null 2>&1; then
+          printf '%s' "$c"; return 0
+        fi
+      done
+      printf '%s' "${PD_PYTHON_BIN:-/opt/conda/bin/python3}"
+    }
+    PYTHON_BIN="$(_resolve_python_bin)"
+    log "python 解释器: ${PYTHON_BIN}"
+
+    # ==========================================================
+    # 1. 拓扑解析 (LWS 注入 → nnodes / node-rank / master)
+    # ==========================================================
+    NODE_RANK="${LWS_WORKER_INDEX:-0}"
+    NNODES="${LWS_GROUP_SIZE:-1}"
+
+    _leader_pod_name() {
+      if [ "${NODE_RANK}" = "0" ]; then printf '%s' "${POD_NAME:-}"; return 0; fi
+      [ -n "${POD_NAME:-}" ] || return 0
+      printf '%s' "${POD_NAME%-${NODE_RANK}}"
+    }
+
+    _api_get_pod_ip() {
+      local pod="$1" ns token
+      [ -n "${pod}" ] || return 0
+      ns="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo metax-ai-pd)"
+      token="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || true)"
+      [ -n "${token}" ] || return 0
+      "${PYTHON_BIN:-python3}" - "${pod}" "${ns}" "${token}" <<'PY' 2>/dev/null || true
+    import json, os, ssl, sys, urllib.request
+    pod, ns, token = sys.argv[1], sys.argv[2], sys.argv[3]
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "10.233.0.1")
+    port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+    url = "https://%s:%s/api/v1/namespaces/%s/pods/%s" % (host, port, ns, pod)
+    ctx = ssl.create_default_context(cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            print(json.load(r).get("status", {}).get("podIP") or "")
+    except Exception:
+        pass
+    PY
+    }
+
+    MASTER_IP=""
+    if [ -n "${PD_MASTER_IP:-}" ]; then
+      MASTER_IP="${PD_MASTER_IP}"
+      log "master 来源: PD_MASTER_IP(显式) = ${MASTER_IP}"
+    fi
+    if [ -z "${MASTER_IP}" ] && [ "${NODE_RANK}" = "0" ]; then
+      MASTER_IP="${POD_IP:-}"
+      [ -n "${MASTER_IP}" ] && log "master 来源: rank0 自身 POD_IP = ${MASTER_IP}"
+    fi
+    if [ -z "${MASTER_IP}" ]; then
+      _leader="$(_leader_pod_name)"
+      _leader_ip=""
+      for _try in 1 2 3 4 5 6 7 8 9 10; do
+        _leader_ip="$(_api_get_pod_ip "${_leader}")"
+        [ -n "${_leader_ip}" ] && break
+        log "等待 leader pod '${_leader}' 的 podIP... (${_try}/10)"
+        sleep 3
+      done
+      if [ -n "${_leader_ip}" ]; then
+        MASTER_IP="${_leader_ip}"
+        log "master 来源: K8s API leader '${_leader}' -> ${MASTER_IP}"
+      fi
+    fi
+    if [ -z "${MASTER_IP}" ]; then
+      die "无法确定 master 地址 (rank=${NODE_RANK}, leader='${_leader:-<空>}'); 请设置 PD_MASTER_IP"
+    fi
+
+    DIST_ADDR="${MASTER_IP}:${PD_DIST_INIT_PORT:-5000}"
+
+    # ==========================================================
+    # 1.5 网卡自适应 (对齐厂商 get_net_primary_iface; 节点 28 管理网卡特例)
+    # ==========================================================
+    _net_primary_iface() {
+      local i=""
+      if command -v ip >/dev/null 2>&1; then
+        i="$( { ip route get 8.8.8.8 2>/dev/null | grep -oP '(?<=dev )\S+' | head -1; } || true)"
+      fi
+      [ -n "${i}" ] || i="$( { awk '$2=="00000000" {print $1; exit}' /proc/net/route 2>/dev/null; } || true)"
+      printf '%s' "${i}"
+    }
+    _iface="${PD_SOCKET_IFNAME:-auto}"
+    if [ "${_iface}" = "auto" ] || [ -z "${_iface}" ]; then
+      _iface="$(_net_primary_iface)"
+      [ -n "${_iface}" ] || die "无法探测默认路由网卡, 请显式设置 PD_SOCKET_IFNAME"
+      log "网卡自适应: auto -> ${_iface}"
+    fi
+    export PD_SOCKET_IFNAME="${_iface}"
+    export GLOO_SOCKET_IFNAME="${_iface}"
+    export NCCL_SOCKET_IFNAME="${_iface}"
+    export MCCL_SOCKET_IFNAME="${_iface}"
+    export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME="${_iface}"
+    export MXSHMEM_BOOTSTRAP_UID_SOCK_IFNAME="${_iface}"
+
+    # ==========================================================
+    # 2. argv 组装 (用户给定参数 + PD/角色专属)
+    # ==========================================================
+    PD_MODEL_PATH="${PD_MODEL_PATH:-/workspace/data/DeepSeek-V4-Flash-0731-W8A8}"
+    [ -d "${PD_MODEL_PATH}" ] || warn "模型目录不存在: ${PD_MODEL_PATH} (hostPath 挂载/模型分发是否就绪?)"
+
+    if [ "${PD_ROLE}" = "prefill" ]; then
+      PD_MEM_DEFAULT="0.82"
+    else
+      PD_MEM_DEFAULT="0.75"
+    fi
+
+    ARGS=(
+      --model-path "${PD_MODEL_PATH}"
+      --tp-size "${PD_TP_SIZE:-8}"
+      --trust-remote-code
+      --context-length "${PD_CONTEXT_LENGTH:-400000}"
+      --max-running-requests "${PD_MAX_RUNNING_REQUESTS:-10}"
+      --port "${PD_HTTP_PORT:-8000}"
+      --host 0.0.0.0
+      --tool-call-parser deepseekv4
+      --reasoning-parser deepseek-v4
+      --served-model-name DeepSeek-V4-Flash
+      --chunked-prefill-size "${PD_CHUNKED_PREFILL_SIZE:-16384}"
+      --page-size "${PD_PAGE_SIZE:-64}"
+      --kv-cache-dtype "${PD_KV_CACHE_DTYPE:-bfloat16}"
+      --schedule-conservativeness "${PD_SCHEDULE_CONSERVATIVENESS:-0.6}"
+      --nnodes "${NNODES}"
+      --node-rank "${NODE_RANK}"
+      --dist-init-addr "${DIST_ADDR}"
+      --disaggregation-mode "${PD_ROLE}"
+      --disaggregation-ib-device "${PD_DISAGG_IB_DEVICE:-mlx5_0}"
+      --disaggregation-bootstrap-port "${PD_BOOTSTRAP_PORT:-8998}"
+      --dist-timeout "${PD_DIST_TIMEOUT:-300}"
+      --mem-fraction-static "${PD_MEM_FRACTION_STATIC:-${PD_MEM_DEFAULT}}"
+      --enable-metrics
+    )
+
+    # PP: PD_PP_SIZE>1 时传 --pp-size + 官方层分区 (官方脚本 get_pp_layer_partition)
+    if [ "${PD_PP_SIZE:-1}" -gt 1 ]; then
+      ARGS+=( --pp-size "${PD_PP_SIZE:-4}" )
+      case "${PD_PP_SIZE}" in
+        2) export SGLANG_PP_LAYER_PARTITION="22,21" ;;
+        4) export SGLANG_PP_LAYER_PARTITION="11,11,11,10" ;;
+        8) export SGLANG_PP_LAYER_PARTITION="6,5,5,5,6,5,6,5" ;;
+      esac
+    fi
+
+    # dp>1 必须 dp-attention
+    if [ "${PD_DP_SIZE:-4}" -gt 1 ]; then
+      ARGS+=( --dp-size "${PD_DP_SIZE:-4}" --enable-dp-attention --enable-dp-lm-head )
+    fi
+
+    # decode 专属: DSPARK 投机解码 + CUDA graph
+    if [ "${PD_ROLE}" = "decode" ]; then
+      ARGS+=(
+        --speculative-algorithm DSPARK
+        --speculative-dspark-block-size "${PD_DSPARK_BLOCK_SIZE:-6}"
+        --cuda-graph-max-bs "${PD_CUDA_GRAPH_MAX_BS:-8}"
+      )
+    fi
+
+    # 自由追加
+    if [ -n "${PD_EXTRA_ARGS:-}" ]; then
+      ARGS+=( ${PD_EXTRA_ARGS} )
+    fi
+
+    # ==========================================================
+    # 3. 启动摘要
+    # ==========================================================
+    echo "[INFO] ============================================================"
+    echo "[INFO] DeepSeek-V4-Flash-0731 PD Launcher (0.5.14 official image, explicit)"
+    echo "[INFO] ------------------------------------------------------------"
+    echo "[INFO] PD_ROLE          : ${PD_ROLE}"
+    echo "[INFO] Master IP        : ${MASTER_IP}"
+    echo "[INFO] NNodes / Rank    : ${NNODES} / ${NODE_RANK}"
+    echo "[INFO] Dist Addr        : ${DIST_ADDR}"
+    echo "[INFO] Model Path       : ${PD_MODEL_PATH}"
+    echo "[INFO] TP/PP/DP/EP      : ${PD_TP_SIZE:-8}/${PD_PP_SIZE:-1}/${PD_DP_SIZE:-4}/1"
+    echo "[INFO] Mem Fraction     : ${PD_MEM_FRACTION_STATIC:-${PD_MEM_DEFAULT}}"
+    echo "[INFO] Python           : ${PYTHON_BIN}"
+    echo "[INFO] Socket Iface     : ${_iface}"
+    echo "[INFO] Final Cmd        : ${PYTHON_BIN} -m sglang.launch_server ${ARGS[*]}"
+    echo "[INFO] ============================================================"
+
+    if [ -n "${PD_DRY_RUN:-}" ]; then
+      echo "[INFO] PD_DRY_RUN set, exiting."
+      exit 0
+    fi
+
+    exec "${PYTHON_BIN}" -m sglang.launch_server "${ARGS[@]}"

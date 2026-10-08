@@ -1,0 +1,22 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# [BH-retract-fix] 0.5.14-maca 官方镜像 + decode retract 崩溃最小修复
+#
+# 问题: decode 高并发 KV 压力 retract -> offload_kv_cache -> 混合 SWA 池
+#   get_cpu_copy NotImplementedError -> scheduler 崩 -> gloo 级联整组退出
+#   （0.5.14 官方镜像 2026-10-08 实测 2 次复现; 与 0.5.12 同款缺陷）
+#
+# 修复 (见 apply_retract_fix.py, 对齐 0.5.12 patch 0001+0002, 仅 2 文件 3 处):
+#   A. retract_decode: 无 offload 能力 -> FINISH_ABORT 优雅降级
+#   B. release_req: offload_kv_cache 调用加能力 gate
+#   C. func_timer.py: Histogram 重复注册 guard（防 DuplicateTimeseries 整 pod 退出）
+#
+# 构建:
+#   sudo docker build -f Dockerfile.retractfix -t harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-retractfix .
+#   sudo docker push harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-retractfix
+# ═══════════════════════════════════════════════════════════════════════════
+FROM harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-torch2.10-py312-ubuntu22.04-amd64
+
+COPY apply_retract_fix.py /tmp/apply_retract_fix.py
+RUN /opt/conda/bin/python3 /tmp/apply_retract_fix.py \
+ && /opt/conda/bin/python3 -c "import ast; base='/opt/conda/lib/python3.12/site-packages/sglang/srt/'; sb=base+'managers/schedule_batch.py'; ft=base+'observability/func_timer.py'; [ast.parse(open(f).read()) for f in (sb, ft)]; assert '[BH-retract-fix]' in open(sb).read(), 'retract-fix marker missing'; assert '[BH-patch3]' in open(ft).read(), 'func_timer marker missing'; print('[Dockerfile] retract-fix verified on 2 files')" \
+ && rm -f /tmp/apply_retract_fix.py

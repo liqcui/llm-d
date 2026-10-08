@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: group-1-prefill-worker
+  namespace: deepseek-pd
+spec:
+  serviceName: group-1-prefill
+  replicas: 4
+  selector:
+    matchLabels:
+      app: group-1-prefill-worker
+  template:
+    metadata:
+      labels:
+        app: group-1-prefill-worker
+    spec:
+      nodeSelector:
+        pd-role: group-1-prefill
+      tolerations:
+      - key: node-role.alibabacloud.com/bmcp
+        operator: Exists
+        effect: NoSchedule
+      hostNetwork: true
+      hostIPC: true
+      hostPID: true
+      containers:
+      - name: agent
+        image: 10.200.119.83:5000/sglang:maca-250822-deepep-250917-mcoplib-0923-stepmesh-0.0.1.dev0
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        volumeMounts:
+        - name: volume-dataset
+          mountPath: /mnt/storage
+        - name: nfs-workspace
+          mountPath: /mnt/nfs
+        - name: mxdriver
+          mountPath: /opt/mxdriver
+        - name: ib-nic
+          mountPath: /dev/infiniband
+        - name: mxcd
+          mountPath: /dev/mxcd
+        - name: shm
+          mountPath: /dev/shm
+        securityContext:
+          privileged: true
+          runAsGroup: 44
+          seccompProfile:
+            type: Unconfined
+          allowPrivilegeEscalation: true
+          capabilities:
+            add:
+            - ALL
+        resources:
+          requests:
+            memory: 500Gi
+            cpu: '64'
+            metax-tech.com/gpu: 8
+          limits:
+            memory: 500Gi
+            cpu: '64'
+            metax-tech.com/gpu: 8
+        ports:
+        - containerPort: 5000
+        - containerPort: 8998
+        command:
+        - /bin/bash
+        - /mnt/nfs/sglang-k8s/startup.sh
+        - prefill
+      volumes:
+      - name: volume-dataset
+        hostPath:
+          path: /bgfs
+          type: Directory
+      - name: nfs-workspace
+        persistentVolumeClaim:
+          claimName: nfs-pvc
+      - name: maca
+        hostPath:
+          path: /opt/maca
+      - name: mxdriver
+        hostPath:
+          path: /opt/mxdriver
+      - name: ib-nic
+        hostPath:
+          path: /dev/infiniband
+      - name: mxcd
+        hostPath:
+          path: /dev/mxcd
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi
