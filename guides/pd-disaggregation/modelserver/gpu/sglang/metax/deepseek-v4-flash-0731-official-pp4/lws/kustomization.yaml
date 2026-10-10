@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 沐曦 (MetaX) SGLang PD 分离 — DeepSeek-V4-Flash-0731 — **PP4 对比战役**（official 官方脚本模式）
+#
+# 目的: 官方 0.5.14 镜像 + llm-launch 官方脚本, 厂商推荐默认拓扑 (prefill PP4/tp8/dp1)
+#       vs 当前 PP1 最优解 (explicit) 的全面性能比较。
+#   · 拓扑: prefill tp8/pp4/dp1 (厂商默认), decode tp8/dp4/ep1 + DSPARK (与 PP1 侧引擎参数对齐)
+#   · 镜像: harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-llm-retractfix
+#   · 启动: PD_LAUNCH_MODE=official (pd-launcher 双模式, exec 镜像内 llm-launch 脚本)
+#   · 并发: decode_max_running_requests_specific=16 (×dp4=64, 对齐 PP1 cap64)
+#   · L2: MY_ENABLE_HICACHE=0 (off)
+#
+# ⚠️ 与 deepseek-v4-flash-0731-pp1 资源**同名** (decode/prefill-dsv4-0731) —
+#    同一时刻只能 apply 其一; 互切 = kubectl apply -k 对方目录 (就地滚动)。
+#
+# 目录结构:
+#   base/ — LWS ×2 + Services + SA + rbac + pd-launcher-dsv4-0731 (双模式启动器)
+#   kustomization.yaml — 部署入口
+
+namespace: metax-ai-pd
+
+resources:
+  - base
