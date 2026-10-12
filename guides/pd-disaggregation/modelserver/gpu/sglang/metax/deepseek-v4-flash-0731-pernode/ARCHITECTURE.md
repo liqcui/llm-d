@@ -87,6 +87,13 @@ decode : tp8 跨 4 节点 + dp4 + DSPARK（与 2.2 同构）
 - **为何长上下文快**：65K prompt 被切成 4 级流水并行 prefill → TTFT 5.3s（pernode 13.0s）
 - 缺点：官方脚本路径税（4K 单流 +3.8s）+ 崩溃率 6-10x → 仅作长单流特解
 
+### 2.4 单机（非 PD 参照）
+```
+node35: 1 台引擎 tp8 节点内 + DSPARK（无 prefill/decode 分离、无 KV 传输）
+```
+- 定位：**量化"PD 税"与"节点内 tp8 红利"的基准**（单流 224 tok/s / ITL 4.5ms）
+- PD 相对单机的净代价 ≈ 单流 224→pernode 178（含 1 次 KV 跳与配对开销）
+
 ### 2.5 full4p4d —— "真正的 4P+4D 全量"（对照变体，2026-10-13 建，待首启验证）
 ```
 node28+29+31+36 ── 1 台 prefill 引擎: tp32 跨 4 节点 (每节点 8 卡全入池) / dp1
@@ -100,13 +107,6 @@ node32+33+34+35 ── 1 台 decode  引擎: tp32 跨 4 节点 / dp1 + DSPARK
 - 参数：cp/keep 见目录 README（cap64 / graph-bs 80（>cap 规则）/ DSPARK on）。
 - 状态：**脚本就绪（渲染+kustomize 离线验证通过）**；首启验证清单 + 备选 graph 组合见其 README；
   **压测待用户批准后与 pernode 同场景全套对照**。
-
-### 2.4 单机（非 PD 参照）
-```
-node35: 1 台引擎 tp8 节点内 + DSPARK（无 prefill/decode 分离、无 KV 传输）
-```
-- 定位：**量化"PD 税"与"节点内 tp8 红利"的基准**（单流 224 tok/s / ITL 4.5ms）
-- PD 相对单机的净代价 ≈ 单流 224→pernode 178（含 1 次 KV 跳与配对开销）
 
 ---
 
