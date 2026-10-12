@@ -161,6 +161,7 @@ client → router:8001
 
 ## §7 证据与文档索引
 - **部署与运维手册：`DEPLOY.md`**（组件清单/步骤/验收/故障处置/互切回滚/文档全景）
+- **全拓扑架构白皮书：`ARCHITECTURE.md`**（四形态架构图/PD 请求流程/参数详解/设计决策依据）
 - 综合对比：`sglang-benchmark-tools/docs/TEST-REPORT-2026-10-10-0731-comprehensive.md` §9
 - 包络报告：`…/TEST-REPORT-2026-10-12-stable-envelope-0731.md`（修订指针）
 - 全部 run：DuckDB `data/bench.duckdb`（labels 见 §3）

@@ -1,7 +1,7 @@
 # DEPLOY — deepseek-v4-flash-0731-pernode 部署与运维手册
 
 > 本文档 = 该形态**从零到生产**的完整操作规格（配置项/步骤/验证/运维/回滚/故障）。
-> 参数取值依据见 `OPTIMIZATION.md`；性能数据索引见其 §7。
+> 参数取值依据见 `OPTIMIZATION.md`（含 Router 实现 §6）；**全拓扑架构/流程/参数详解见 `ARCHITECTURE.md`**；性能数据索引见 OPTIMIZATION §7。
 
 ---
 
