@@ -21,7 +21,7 @@ readonly node_rank="$3"
 
 # ⚠️ 必须显式传**空**的 model spec：common.sh 会把调用者的 $1 当成模型规格，
 #    而本脚本的 $1 是 master IP ⇒ 不传就会
-#      Error: Model specification '10.66.1.232' could not be resolved ... (common.sh:31)
+#      Error: Model specification '{{IP_LEGACY_SAMPLE}}' could not be resolved ... (common.sh:31)
 #    （2026-09-21 实测；空字符串会让它跳过模型路径解析，本用例只需要 MOONCAKE_* env）
 source "$script_dir/common.sh" "" ""
 

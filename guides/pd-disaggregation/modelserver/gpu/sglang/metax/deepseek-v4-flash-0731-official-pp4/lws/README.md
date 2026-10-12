@@ -132,7 +132,7 @@ curl -s -o /dev/null -w "%{http_code}\n" "http://<prefill-ip>:8998/route?prefill
 # 4) metrics
 curl -s http://<prefill-ip>:8000/metrics | grep -v '^#' | wc -l
 # 5) 端到端 (router)
-curl -s --max-time 120 -X POST http://10.66.3.32:8001/v1/chat/completions \
+curl -s --max-time 120 -X POST http://{{IP_DECODE_3}}:8001/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"DeepSeek-V4-Flash","messages":[{"role":"user","content":"请只回复 OK"}],"max_tokens":16,"temperature":0}'
 ```
@@ -150,3 +150,5 @@ curl -s --max-time 120 -X POST http://10.66.3.32:8001/v1/chat/completions \
 | router `all circuits open or unhealthy` 且后端健康 | router 熔断在失败请求后不自动闭合 → 重启 router pod |
 | DSPARK `gamma mismatch: gamma=6 but draft block_size=5` | 警告级；block_size 6 → num_draft_tokens 7 → gamma 6，按用户给定参数保留 |
 | `wqkv_a.weight_offset` not initialized 告警 | offset 全零 (实测 max|.|=0) 且 mctlass 路径不用, 无害 |
+
+> **IP 脱敏**：本目录所有 `{{占位符}}` 经 `../../tools/render_site.py` + `site-config.env` （从 `.example` 拷贝填写，不入库）渲染后部署；详见 pernode `DEPLOY.md` 步骤 ⓪①。

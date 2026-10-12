@@ -1,7 +1,7 @@
 # SGLang Router Deployment — DeepSeek-V4-Flash-0731 (0.5.14, pp1) (sglang 默认网关, 与 llm-d EPP 并行)
 #
 # 用途: 与 llm-d EPP 网关做性能对比的第二个入口 (sglbench DeepSeek 场景默认走
-#   ROUTER = 10.66.3.32:8001)。
+#   ROUTER = {{IP_DECODE_3}}:8001)。
 #   集群外直连: http://<router 节点 IP>:8001/v1/chat/completions
 #   Metrics:    http://<router 节点 IP>:29000/metrics
 #
@@ -92,9 +92,9 @@ spec:
             # 当前占位: 部署后替换为实际 master IP (kubectl get pods -o wide | grep dsv4-0731)
             #   prefill → prefill-dsv4-0731-0:<8000>   decode → decode-dsv4-0731-0:<8200>
             - name: PD_PREFILL_ENDPOINTS
-              value: "10.66.3.29:8000,10.66.3.31:8000,10.66.3.36:8000,10.66.3.28:8000"   # per-node: 4 个独立 prefill 引擎 (节点=29/31/36/28)
+              value: "{{IP_PREFILL_0}}:8000,{{IP_PREFILL_1}}:8000,{{IP_PREFILL_2}}:8000,{{IP_PREFILL_3}}:8000"   # per-node: 4 个独立 prefill 引擎 (节点=29/31/36/28)
             - name: PD_DECODE_ENDPOINTS
-              value: "10.66.3.35:8200,10.66.3.34:8200,10.66.3.33:8200,10.66.3.32:8200"   # per-node: 4 个独立 decode 引擎 (节点=35/34/33/32)
+              value: "{{IP_DECODE_0}}:8200,{{IP_DECODE_1}}:8200,{{IP_DECODE_2}}:8200,{{IP_DECODE_3}}:8200"   # per-node: 4 个独立 decode 引擎 (节点=35/34/33/32)
             - name: PD_BOOTSTRAP_PORT
               value: "8998"
             - name: PD_ROUTER_HTTP_PORT

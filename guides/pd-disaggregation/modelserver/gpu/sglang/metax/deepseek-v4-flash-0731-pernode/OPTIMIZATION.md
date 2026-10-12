@@ -107,14 +107,14 @@
 ### 6.2 启动方式（本部署实际命令，router.yaml）
 ```bash
 python3 -m sglang_router.launch_router --pd-disaggregation \
-  --prefill http://10.66.3.29:8000 8998   # ×4: 每台 prefill 引擎的 HTTP + 其 bootstrap 端口
-  --prefill http://10.66.3.31:8000 8998
-  --prefill http://10.66.3.36:8000 8998
-  --prefill http://10.66.3.28:8000 8998
-  --decode  http://10.66.3.35:8200        # ×4: 每台 decode 引擎
-  --decode  http://10.66.3.34:8200
-  --decode  http://10.66.3.33:8200
-  --decode  http://10.66.3.32:8200
+  --prefill http://{{IP_PREFILL_0}}:8000 8998   # ×4: 每台 prefill 引擎的 HTTP + 其 bootstrap 端口
+  --prefill http://{{IP_PREFILL_1}}:8000 8998
+  --prefill http://{{IP_PREFILL_2}}:8000 8998
+  --prefill http://{{IP_PREFILL_3}}:8000 8998
+  --decode  http://{{IP_DECODE_0}}:8200        # ×4: 每台 decode 引擎
+  --decode  http://{{IP_DECODE_1}}:8200
+  --decode  http://{{IP_DECODE_2}}:8200
+  --decode  http://{{IP_DECODE_3}}:8200
   --host 0.0.0.0 --port 8001 \
   --request-timeout-secs 18000 --health-check-timeout-secs 90
 ```

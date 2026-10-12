@@ -46,3 +46,5 @@ kubectl apply -k deepseek-v4-flash-0731-pernode/lws/
 详见 `sglang-benchmark-tools/docs/TEST-REPORT-2026-10-10-0731-comprehensive.md` §9。
 
 > 完整部署与运维手册见 `DEPLOY.md`；最优参数解见 `OPTIMIZATION.md`；全拓扑架构白皮书见 `ARCHITECTURE.md`。
+
+> **IP 脱敏**：本目录所有 `{{占位符}}` 经 `../tools/render_site.py` + `site-config.env` （从 `.example` 拷贝填写，不入库）渲染后部署；详见 `DEPLOY.md` 步骤 ⓪①。

@@ -132,7 +132,7 @@ curl -s -o /dev/null -w "%{http_code}\n" "http://<prefill-ip>:8998/route?prefill
 # 4) metrics
 curl -s http://<prefill-ip>:8000/metrics | grep -v '^#' | wc -l
 # 5) 端到端 (router)
-curl -s --max-time 120 -X POST http://10.66.3.32:8001/v1/chat/completions \
+curl -s --max-time 120 -X POST http://{{IP_DECODE_3}}:8001/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"DeepSeek-V4-Flash","messages":[{"role":"user","content":"请只回复 OK"}],"max_tokens":16,"temperature":0}'
 ```

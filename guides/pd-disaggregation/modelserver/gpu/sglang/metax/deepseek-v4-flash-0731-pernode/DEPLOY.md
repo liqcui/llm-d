@@ -42,11 +42,14 @@ deepseek-v4-flash-0731-pernode/
 ## 3. 部署步骤（step-by-step）
 
 ```bash
-# ① 填写 router 端点（= 各角色 LWS group-0 落点的宿主机 IP）
-#    本集群固定映射: prefill 29/31/36/28 → :8000；decode 35/34/33/32 → :8200
-#    若节点集不同: 部署后从 `kubectl get pods -o wide` 读取并回填 router.yaml
-# ② 部署
-kubectl apply -k deepseek-v4-flash-0731-pernode/lws/
+# ⓪ IP 脱敏约定: 仓库内全部为 {{占位符}}; 真实 IP 通过站点配置在部署时注入
+cp deepseek-v4-flash-0731-pernode/site-config.env.example \
+   deepseek-v4-flash-0731-pernode/site-config.env      # ← 填写真实节点 IP（本集群: prefill 29/31/36/28, decode 35/34/33/32; 配置文件不入库）
+# ① 渲染（读取 site-config.env → _rendered/lws/）
+python3 ../tools/render_site.py deepseek-v4-flash-0731-pernode
+python3 ../tools/render_site.py deepseek-v4-flash-0731-pernode --check   # 可选: 校验无未解析占位符
+# ② 部署（经渲染产物）
+kubectl apply -k deepseek-v4-flash-0731-pernode/_rendered/lws/
 # ③ 等待 8 台引擎就绪（每台 boot ~5min；8 台并行）
 kubectl -n metax-ai-pd get pods -l llm-app --no-headers | grep dsv4-0731   # 期望 8×(2/2 或 1/1)
 # ④ E2E 验收
