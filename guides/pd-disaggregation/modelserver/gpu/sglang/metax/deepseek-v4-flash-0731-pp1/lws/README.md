@@ -150,3 +150,5 @@ curl -s --max-time 120 -X POST http://10.66.3.32:8001/v1/chat/completions \
 | router `all circuits open or unhealthy` 且后端健康 | router 熔断在失败请求后不自动闭合 → 重启 router pod |
 | DSPARK `gamma mismatch: gamma=6 but draft block_size=5` | 警告级；block_size 6 → num_draft_tokens 7 → gamma 6，按用户给定参数保留 |
 | `wqkv_a.weight_offset` not initialized 告警 | offset 全零 (实测 max|.|=0) 且 mctlass 路径不用, 无害 |
+
+> 0731 PD 家族文档：最佳配置=pernode（`../deepseek-v4-flash-0731-pernode/{OPTIMIZATION,DEPLOY}.md`）；本目录=旧基线 explicit 形态。

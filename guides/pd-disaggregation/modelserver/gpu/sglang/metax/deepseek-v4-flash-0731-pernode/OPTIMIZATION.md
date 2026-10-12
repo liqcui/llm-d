@@ -160,6 +160,7 @@ client → router:8001
 3. 压测 harness 一律经 router:8001（与生产同路径）。
 
 ## §7 证据与文档索引
+- **部署与运维手册：`DEPLOY.md`**（组件清单/步骤/验收/故障处置/互切回滚/文档全景）
 - 综合对比：`sglang-benchmark-tools/docs/TEST-REPORT-2026-10-10-0731-comprehensive.md` §9
 - 包络报告：`…/TEST-REPORT-2026-10-12-stable-envelope-0731.md`（修订指针）
 - 全部 run：DuckDB `data/bench.duckdb`（labels 见 §3）

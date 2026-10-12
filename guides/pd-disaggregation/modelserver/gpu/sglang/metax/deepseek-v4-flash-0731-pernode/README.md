@@ -44,3 +44,5 @@ kubectl apply -k deepseek-v4-flash-0731-pernode/lws/
 **已知缺点**：65K 级长单流 prefill 无 PP 流水线（13.0s vs pp4 的 5.3s）；
 8 引擎运维面 ×2；per-engine 参数语义需记 graph-bs>cap 规则。
 详见 `sglang-benchmark-tools/docs/TEST-REPORT-2026-10-10-0731-comprehensive.md` §9。
+
+> 完整部署与运维手册见 `DEPLOY.md`；最优参数解见 `OPTIMIZATION.md`。

@@ -30,3 +30,5 @@ kubectl apply -k deepseek-v4-flash-0731-pp1/lws/   # 再补 cap64/L2 等 live �
 2. 0731 模型 spec（镜像内）model 路径为旧 modelslim 目录 → 由 `PD_MODEL_PATH` 回写修正。
 3. prefill `prefill_pp_size_default` 双变量回写（0.5.13 血统坑）；dp>1 时自动注入 dp-attention。
 4. decode max-running 厂商语义 = 每 DP rank（×dp 为总并发）。
+
+> 0731 PD 家族文档：最佳配置=pernode（`../deepseek-v4-flash-0731-pernode/{OPTIMIZATION,DEPLOY}.md`）；本目录=厂商脚本 PP4 对照特解。
