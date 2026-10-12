@@ -127,9 +127,9 @@ spec:
               - name: PD_DISAGG_IB_DEVICE
                 value: "mlx5_0"
               - name: PD_HCA_LIST
-                value: "mlx5_0,mlx5_1"   # 官方脚本回写 hca_list (厂商默认 mlx5_bond_* 本环境不存在; L2-PP1 实测值)
+                value: "mlx5_0"      # 对齐复测: 单轨 (与 decode/显式路径一致); 原双轨 mlx5_0,mlx5_1
               - name: PD_MOONCAKE_IB_DEVICE
-                value: "mlx5_0,mlx5_1"
+                value: "mlx5_0"
               # 拓扑: PP4 = 厂商默认 (tp=32/pp4=8 × dp1 = 32 卡); dp>1 时才需 dp-attention
               - name: PD_TP_SIZE
                 value: "8"

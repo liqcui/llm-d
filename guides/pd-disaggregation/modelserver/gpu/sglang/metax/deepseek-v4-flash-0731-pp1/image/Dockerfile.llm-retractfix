@@ -1,0 +1,9 @@
+# [PP4 对比战役] -llm (官方 llm-launch 适配) + retract 修复
+# 用途: official 脚本模式下 PP4-vs-PP1 对比的引擎镜像 (两侧代码对齐)
+# 构建: sudo docker build -f Dockerfile.llm-retractfix -t harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-llm-retractfix .
+FROM harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-llm
+
+COPY apply_retract_fix.py /tmp/apply_retract_fix.py
+RUN /opt/conda/bin/python3 /tmp/apply_retract_fix.py \
+ && /opt/conda/bin/python3 -c "import ast; base='/opt/conda/lib/python3.12/site-packages/sglang/srt/'; sb=base+'managers/schedule_batch.py'; ft=base+'observability/func_timer.py'; [ast.parse(open(f).read()) for f in (sb, ft)]; assert '[BH-retract-fix]' in open(sb).read(), 'retract-fix marker missing'; assert '[BH-patch3]' in open(ft).read(), 'func_timer marker missing'; print('[Dockerfile.llm-retractfix] retract-fix verified')" \
+ && rm -f /tmp/apply_retract_fix.py

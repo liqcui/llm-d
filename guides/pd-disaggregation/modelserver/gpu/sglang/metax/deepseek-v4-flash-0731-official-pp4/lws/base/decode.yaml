@@ -130,7 +130,7 @@ spec:
               - name: PD_CONTEXT_LENGTH
                 value: "400000"
               - name: PD_CHUNKED_PREFILL_SIZE
-                value: "16384"
+                value: "4096"        # 对齐复测: 厂商 decode 侧 ×dp4 = 16384 (与显式侧 --chunked-prefill-size 16384 一致); 原 16384×dp=65536
               - name: decode_max_running_requests_specific
                 value: "16"          # ⚠ 厂商语义=每 DP rank; ×dp4 = 64 总并发 (与 PP1 explicit cap64 对齐)
               - name: PD_EP_SIZE
