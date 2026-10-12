@@ -238,13 +238,17 @@ data:
       )
     fi
 
-    # decode 专属: DSPARK 投机解码 + CUDA graph
+    # decode 专属: DSPARK 投机解码 (PD_ENABLE_DSPARK=0 可关闭做 A/B) + CUDA graph
     if [ "${PD_ROLE}" = "decode" ]; then
-      ARGS+=(
-        --speculative-algorithm DSPARK
-        --speculative-dspark-block-size "${PD_DSPARK_BLOCK_SIZE:-6}"
-        --cuda-graph-max-bs "${PD_CUDA_GRAPH_MAX_BS:-8}"
-      )
+      if [ "${PD_ENABLE_DSPARK:-1}" = "1" ]; then
+        ARGS+=(
+          --speculative-algorithm DSPARK
+          --speculative-dspark-block-size "${PD_DSPARK_BLOCK_SIZE:-6}"
+        )
+      else
+        echo "[INFO] PD_ENABLE_DSPARK=0: DSPARK 已关闭 (A/B 对照模式)"
+      fi
+      ARGS+=( --cuda-graph-max-bs "${PD_CUDA_GRAPH_MAX_BS:-8}" )
     fi
 
     # 自由追加
