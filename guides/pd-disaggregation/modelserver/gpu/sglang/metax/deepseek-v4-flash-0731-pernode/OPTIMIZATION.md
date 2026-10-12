@@ -97,7 +97,69 @@
 3. func_timer DuplicateTimeseries（**已修复**，同镜像）。
 4. KV-full 断言（老 PD cap64 重载偶发；pernode 全战役未复现）。
 
-## §6 证据与文档索引
+## §6 Router 层实现（DP/配对/健康 —— pernode 的"服务层 DP"）
+
+### 6.1 组件与镜像
+- 组件：`deployment/deepseek-v4-0731-router`（hostNetwork，:8001 入口 / :29000 metrics，落在 router 标签节点）
+- 镜像：`harbor.isuanova.com/metax/sglang:v0.5.12-glm5-rc4-pd`（**GPUStack maca-sglang-pdrouter-custom 同源**；
+  smg/sglang-router 的 PD 路由器，Rust 实现、无 GPU 依赖；容器启动时需打掉 rc 镜像的 GPU device probe）
+
+### 6.2 启动方式（本部署实际命令，router.yaml）
+```bash
+python3 -m sglang_router.launch_router --pd-disaggregation \
+  --prefill http://10.66.3.29:8000 8998   # ×4: 每台 prefill 引擎的 HTTP + 其 bootstrap 端口
+  --prefill http://10.66.3.31:8000 8998
+  --prefill http://10.66.3.36:8000 8998
+  --prefill http://10.66.3.28:8000 8998
+  --decode  http://10.66.3.35:8200        # ×4: 每台 decode 引擎
+  --decode  http://10.66.3.34:8200
+  --decode  http://10.66.3.33:8200
+  --decode  http://10.66.3.32:8200
+  --host 0.0.0.0 --port 8001 \
+  --request-timeout-secs 18000 --health-check-timeout-secs 90
+```
+- **`--prefill <url> <bootstrap_port>`**：bootstrap 端口告诉 router「该 prefill 的 KV 握手服务在哪个端口」（全部 8998，各节点独立）。
+- 端点**必须=宿主机 IP**（hostNetwork worker）；端点列表即"服务层 DP 的成员表"——**加一个节点 = 列表加一项 + 重启 router**。
+
+### 6.3 选择与配对机制（镜像实测支持的全部策略）
+| 机制 | 可选值 | 本部署取值 |
+|---|---|---|
+| prefill 选择 `--prefill-policy` | random / round_robin / cache_aware / power_of_two / manual / **bucket** | 默认（未显式指定）|
+| decode 选择 `--decode-policy` | random / round_robin / cache_aware / power_of_two / manual | 默认 |
+| 分配模式 `--assignment-mode` | random / min_load / min_group | 默认 |
+| 路由器内部限流 | `--max-concurrent-requests` / `--queue-size` / `--queue-timeout-secs` / `--rate-limit-tokens-per-second` | 默认（未设限）|
+| 重试 | `--retry-max-retries` / backoff 族 / `--disable-retries` | 默认 |
+| 熔断器 | `--cb-failure-threshold` / `--cb-success-threshold` / `--cb-timeout-duration-secs` / `--cb-window-duration-secs` | 默认 |
+| 健康检查 | `--health-*-threshold` / `--health-check-timeout-secs`（本部署 90s） | 部分显式 |
+| **`--dp-aware`** | 路由感知引擎内 DP 秩 | 本形态不用（引擎 dp1；DP 在 router 层） |
+| 服务发现 | `--service-discovery` + selectors | 本部署用**静态列表** |
+
+**实测均衡度**：conc 压测中 4 台 prefill 引擎负载差 <15%（请求级配对接近均分）。
+选源顺序有"配对数"语义——任一角色无可用 worker 时报
+`Failed to select PD pair / No available prefill workers`（日志实测）。
+
+### 6.4 请求全链路（PD 配对流程，日志实证）
+```
+client → router:8001
+  ① router 选 (P, D) 对 + 生成 bootstrap_room
+  ② router → P:/generate（携带路由/D 信息）→ P 执行 prefill
+  ③ D 凭 room 向 P 的 bootstrap(:8998/route) 查询 P 的传输信息 → 建立 mooncake KV 通道
+     （P 侧 KV 传输完成后释放；错误样例: "Error fetching prefill server info from bootstrap"）
+  ④ router → D:/generate → decode 流式输出 → 汇总回 client
+     （router 对 D 的独立调用在日志可见: "Decode request failed decode_url=..."）
+```
+- **失败语义**：worker 异常 → 熔断器打开（"all circuits open or unhealthy"），健康检查恢复后
+  熔断需按 cb 参数闭合——**若 leader 漂移致端点长期错误，熔断不自动恢复，必须重启 router**（本集群实测，运维铁律）。
+- **本架构契合点**：该 router 正是"把 DP 从引擎内搬到服务层"的载体——pairing 粒度=请求；
+  引擎无跨节点依赖后，单引擎重启/故障只影响 1/4 容量，router 自动绕行其余 3 台。
+
+### 6.5 运维要点（历次实测沉淀）
+1. worker 重建后**落点 IP 可能变化**（LWS 组重建）→ 改端点列表 + `scale 0→1` 重启 router
+   （hostNetwork 固定端口，不支持滚动）。
+2. 端点误指（漂移）→ 全站 5xx/503 且熔断不自愈 → 依 ①②处置。
+3. 压测 harness 一律经 router:8001（与生产同路径）。
+
+## §7 证据与文档索引
 - 综合对比：`sglang-benchmark-tools/docs/TEST-REPORT-2026-10-10-0731-comprehensive.md` §9
 - 包络报告：`…/TEST-REPORT-2026-10-12-stable-envelope-0731.md`（修订指针）
 - 全部 run：DuckDB `data/bench.duckdb`（labels 见 §3）
