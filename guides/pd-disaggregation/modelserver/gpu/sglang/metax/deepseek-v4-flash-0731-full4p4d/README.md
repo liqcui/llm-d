@@ -3,6 +3,11 @@
 **目的**：与 pernode 做**同硬件总量（64 卡）**的公平对照——修复老家族"每节点仅 2 卡入池"
 的布局工件（全集群 16/64 卡，见 `../deepseek-v4-flash-0731-pernode/ARCHITECTURE.md` §2.2 证据）。
 
+> **等价关系（重要）**：本形态 = **"pp1-explicit 形态的全量修正版"**——同一 explicit 启动链路、
+> 同一引擎（单大引擎/引擎内并行），仅 `tp 8→32` 使 8 卡/节点全入池（机理：引擎按
+> `每节点卡数 = 总 rank/nnodes` 派生本地 worker：tp8/4 节点→2 卡；tp32/4 节点→8 卡）。
+> 重测名单中"pp1-explicit（全量）"即指本目录。
+
 ## 对照设计（两形态均 8 卡/节点全量）
 | | pernode（现状最优） | **full4p4d（本目录, 待验证）** |
 |---|---|---|
@@ -18,7 +23,7 @@
 |---|---|---|
 | `PD_TP_SIZE` | **32** | 8 卡/节点 × 4 节点全量；32 % o_groups(8)=0 ✓ |
 | `PD_DP_SIZE` | 1 | 引擎内不切 DP（与 pernode 的 router-DP 形成对照） |
-| `PD_MAX_RUNNING_REQUESTS` | 64 | 单大引擎总槽 |
+| `PD_MAX_RUNNING_REQUESTS` | **48** | 对齐最优解值（单引擎语义=全体槽位；pernode 为 4×48=192） |
 | `PD_CUDA_GRAPH_MAX_BS` | **80** | ⚠ 必须 > max-running（bs 重建缺陷规避，OPTIMIZATION §5.1） |
 | DSPARK | on (block6) | 与 pernode 对齐 |
 | 其余 | 同基线 | retractfix 镜像 / 16K chunked / mem 0.82,0.75 / L2 off |
@@ -41,6 +46,14 @@ kubectl apply -k _rendered/lws/
    | B | 40 | 80 | 40 |
    | C | 16 | 32 | 16 |
 3. E2E 单请求 200 + 单流速率粗测（非正式压测）。
+
+## 重测名单（用户要求：全部形态均"全量 8 卡/节点"）
+| 形态 | 8 卡/节点表达 | 状态 |
+|---|---|---|
+| pernode（router 层 DP, 4×8 卡引擎） | 天然全量（每引擎=单节点 8 卡） | ✅ 已跑全量数据 |
+| **full4p4d（= pp1-explicit 全量版）** | tp32 = nnodes×8 | 脚本就绪，待首启验证 |
+| pp4-official（全量版） | pp4×tp8=32 卡（8/节点）——⚠ 其"2 卡"为**推断未实测** | 启动后按 mx-smi 实测足迹；若不符需查 vendor 布局 |
+| （对照）pp1 目录保留 tp8 旧形态 = 2 卡/节点的历史态 | — | 归档（资源对齐实验 §5.10 用） |
 
 ## 对照测试计划（待用户批准后执行）
 与 pernode **同场景同负荷**全套：single5/longctx5 + mini-32/64/128c + conc-32/64/128/160 +

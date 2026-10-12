@@ -110,7 +110,7 @@ spec:
               - name: PD_CHUNKED_PREFILL_SIZE
                 value: "16384"
               - name: PD_MAX_RUNNING_REQUESTS
-                value: "64"          # full4p4d: 单大引擎 64 总槽
+                value: "48"          # 对齐最优解值 (单引擎语义; 与 decode 同步)
               # ── HiCache L2 (Host 内存层; prefill 专属开关) ──
               #   1=开 --enable-hierarchical-cache + 伴生 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1
               #   (DSv4 混合 attention 需 UnifiedRadixCache); 参数=0.5.13 L2-PP1 标定组合

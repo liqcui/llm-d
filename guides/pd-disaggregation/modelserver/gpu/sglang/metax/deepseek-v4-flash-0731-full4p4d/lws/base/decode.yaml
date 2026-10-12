@@ -130,9 +130,9 @@ spec:
               - name: PD_CHUNKED_PREFILL_SIZE
                 value: "16384"
               - name: PD_MAX_RUNNING_REQUESTS
-                value: "64"          # full4p4d: 单大引擎 64 总槽
+                value: "48"          # 对齐最优解值 (单引擎语义=全体槽位; pernode 为 4×48=192 总)
               - name: PD_CUDA_GRAPH_MAX_BS
-                value: "80"          # ⚠ 必须 > max-running: adjusted=min(80,64)=64≠80 → 触发 bs 重建
+                value: "80"          # ⚠ 必须 > max-running: adjusted=min(80,48)=48≠80 → 触发 bs 重建
                                      #   (若首启 NoneType 崩: 备选 cap40+graph80(adjusted 40) / cap16+graph32)
               - name: PD_PAGE_SIZE
                 value: "64"
@@ -144,6 +144,8 @@ spec:
                 value: "mlx5_0"
               - name: PD_DSPARK_BLOCK_SIZE
                 value: "6"
+              - name: PD_ENABLE_DSPARK
+                value: "1"           # 对齐最优解 (DSPARK on; 0=A/B)
               # 拓扑 (0.5.14 直启参数; dp 由 launcher 显式传 4)
               - name: PD_TP_SIZE
                 value: "32"          # full4p4d: 单引擎 32 卡全量

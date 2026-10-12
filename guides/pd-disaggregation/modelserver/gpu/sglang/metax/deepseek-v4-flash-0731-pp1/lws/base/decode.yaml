@@ -130,9 +130,9 @@ spec:
               - name: PD_CHUNKED_PREFILL_SIZE
                 value: "16384"
               - name: PD_MAX_RUNNING_REQUESTS
-                value: "40"          # 10-08 调优标定 (conc-64: 660→1901 tok/s; 80 回退 -18.9%)
+                value: "64"          # 家族最优 (final-scan 标定档)
               - name: PD_CUDA_GRAPH_MAX_BS
-                value: "40"          # 引擎内部实际压回 ≤10 (0.5.14 "adjusted to 10")
+                value: "80"          # ⚠ >cap 规则: adjusted=min(80,64//4=16)=16 → 触发 bs 重建
               - name: PD_PAGE_SIZE
                 value: "64"
               - name: PD_KV_CACHE_DTYPE
@@ -143,6 +143,8 @@ spec:
                 value: "mlx5_0"
               - name: PD_DSPARK_BLOCK_SIZE
                 value: "6"
+              - name: PD_ENABLE_DSPARK
+                value: "1"           # 对齐最优解 (DSPARK on)
               # 拓扑 (0.5.14 直启参数; dp 由 launcher 显式传 4)
               - name: PD_TP_SIZE
                 value: "8"
