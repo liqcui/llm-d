@@ -152,7 +152,7 @@ spec:
               - name: PD_DP_SIZE
                 value: "1"           # per-node 形态: 每引擎自包含 tp8/dp1; 4 引擎在 router 层做 DP
               - name: PD_MEM_FRACTION_STATIC
-                value: "0.75"        # rc3 标定 decode 值
+                value: "0.75"        # rc3 标定; A/B-1 (10-15) 判决: 0.78 无收益(c128 劣/c160 持平)保持 0.75
 
               # ── 用户给定 env (0.5.14 验证配置) ──
               - name: PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM

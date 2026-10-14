@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 沐曦 (MetaX) SGLang PD 分离 — DeepSeek-V4-Flash-0731 — 4 Prefill + 4 Decode (0.5.14, pp1 最优拓扑)
+#
+# 参照: deepseek-v4-rc3-maca/lws/ (生产最优解拓扑) + 用户给定 0.5.14 直启参数
+#   · 拓扑: prefill tp8/pp1/dp4, decode tp8/dp4/ep8 + DSPARK 投机解码 (32 卡 4 节点逻辑实例)
+#   · 镜像: harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-torch2.10-py312-ubuntu22.04-amd64
+#   · 启动: explicit (非官方脚本), pd-launcher 直启 python3 -m sglang.launch_server
+#
+# ⚠️ 与 GLM (glm5-maca/lws/) 及 rc3 (deepseek-v4-rc3-maca) 同节点互斥 —
+#    hostNetwork 端口 (8000/8200/5600/5000) 冲突, 不可并存; 节点标签按角色互斥分配。
+#
+# 部署前:
+#   1. LWS CRD 已装; 模型 /data/DeepSeek-V4-Flash-0731-w8a8 已分发到全部候选节点
+#   2. 节点标签 (hostNetwork 端口冲突, 各角色节点互斥):
+#        prefill ×4: kubectl label node <node> metax-sglang-pd-prefill-dsv4-0731=true --overwrite
+#        decode  ×4: kubectl label node <node> metax-sglang-pd-decode-dsv4-0731=true --overwrite
+#        router  ×1: kubectl label node <node> metax-sglang-pd-router-dsv4-0731=true --overwrite
+#   3. 部署后更新 router env 的 master IP (prefill/decode-dsv4-0731-0 实际落点)
+#
+# 目录结构:
+#   base/ — LWS (prefill-dsv4-0731 + decode-dsv4-0731) + headless Services + SA
+#           + rbac (leader IP 解析) + pd-launcher-dsv4-0731 (直启启动器 ConfigMap)
+#   kustomization.yaml — 部署入口
+
+namespace: metax-ai-pd
+
+resources:
+  - base
