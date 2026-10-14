@@ -1,0 +1,321 @@
+# Decode LeaderWorkerSet — DeepSeek-V4-Flash-0731 (0.5.14, pp1) PD 分离
+#
+# 拓扑: LWS replicas=1, size=4 → 1 个 4 节点逻辑实例 (4 pods / 4 节点 / 32 卡)
+#   并行度: tp=8 pp=1 dp=4 (--tp 8; launcher 显式传 dp-size 4 + --enable-dp-attention)
+#   启动:   explicit (非官方脚本) → pd-launcher.sh 直启, decode 侧追加 DSPARK 投机解码
+#           (--speculative-algorithm DSPARK --speculative-dspark-block-size 6)
+#   端口:   modelserver 8200; routing-proxy sidecar 8000 (llm-d EPP 入口, kv-connector=sglang)
+#   EPP:    InferencePool pd-disaggregation 按 llm-d.ai/guide=pd-disaggregation 发现
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: decode-dsv4-0731
+  labels:
+    llm-d.ai/role: decode
+spec:
+  replicas: 4
+  leaderWorkerTemplate:
+    size: 1
+    restartPolicy: RecreateGroupOnPodRestart
+    workerTemplate:
+      metadata:
+        labels:
+          llm-d.ai/role: decode
+          llm-d.ai/model: deepseek-v4-flash-0731
+          llm-d.ai/guide: pd-disaggregation
+      spec:
+        hostNetwork: true
+        hostPID: true
+        hostIPC: true
+        # ⚠ hostNetwork 下 ClusterFirst 会被 kubelet 忽略 → leader 域名解析不到,
+        #   由 pd-launcher 经 K8s API 查 leader podIP (依赖 rbac.yaml pod-reader)
+        dnsPolicy: ClusterFirst
+        serviceAccountName: mx-sglang-pd-lws
+        terminationGracePeriodSeconds: 120
+
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: metax-sglang-pd-decode-dsv4-0731
+                      operator: In
+                      values: ["true"]
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    llm-d.ai/role: decode
+                topologyKey: kubernetes.io/hostname
+
+        securityContext: {}
+
+        # ── llm-d routing-proxy sidecar (EPP 请求入口) ──
+        initContainers:
+          - name: routing-proxy
+            image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.9.0
+            imagePullPolicy: Always
+            args:
+              - --port=8000
+              - --vllm-port=8200
+              - --kv-connector=sglang
+              - --zap-log-level=1
+              - --secure-proxy=false
+            ports:
+              - containerPort: 8000
+                name: sidecar
+                protocol: TCP
+            resources:
+              requests: { memory: "8Gi", cpu: "4" }
+              limits:   { memory: "16Gi", cpu: "8" }
+            restartPolicy: Always
+            securityContext:
+              allowPrivilegeEscalation: false
+              runAsNonRoot: true
+
+        containers:
+          - name: modelserver
+            image: harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-retractfix
+            imagePullPolicy: Always
+            workingDir: /workspace
+            command:
+              - bash
+              - -c
+              - |
+                set -euo pipefail
+
+                # hostNetwork 下补全自身 hostname 解析
+                if ! grep -q "${HOSTNAME}" /etc/hosts 2>/dev/null; then
+                  echo "${POD_IP} ${HOSTNAME}" >> /etc/hosts
+                fi
+
+                ulimit -l unlimited || true
+
+                # 预留端口, 避免 hostNetwork 下被随机占用
+                sysctl -w net.ipv4.ip_local_reserved_ports="${PD_HTTP_PORT},${PD_BOOTSTRAP_PORT},${PD_DIST_INIT_PORT}" 2>/dev/null || true
+
+                # JIT 缓存清理 (与 GLM / rc3 方案对齐)
+                rm -rf /root/.cache/tvm-ffi
+
+                # 日志落盘: hostPath, Pod 重建后仍在
+                mkdir -p /var/log/sglang-dsv4-0731
+                LOG=/var/log/sglang-dsv4-0731/${PD_ROLE}-rank${LWS_WORKER_INDEX:-0}.log
+                echo "[LWS] $(date '+%F %T') group start rank=${LWS_WORKER_INDEX:-0}/${LWS_GROUP_SIZE:-1}" >> "${LOG}"
+
+                # exec + 进程替换: PID1 最终是 python3, 保证 SIGTERM 直达引擎
+                exec bash /workspace/llm-d/pd-launcher.sh > >(tee -a "${LOG}") 2>&1
+            env:
+              # ── 角色 / 结构 ──
+              - name: PD_ROLE
+                value: "decode"
+              - name: PD_HTTP_PORT
+                value: "8200"
+              - name: PD_BOOTSTRAP_PORT
+                value: "8998"
+              - name: PD_DIST_INIT_PORT
+                value: "5000"
+              - name: PD_MASTER_IP
+                value: ""            # 空 = pd-launcher 自动解析 (rank0=POD_IP / K8s API 查 leader)
+              - name: PD_SOCKET_IFNAME
+                value: "auto"        # launcher 按默认路由探测 (节点 28 管理网卡特例)
+              - name: PD_MODEL_PATH
+                value: "/workspace/data/DeepSeek-V4-Flash-0731-W8A8"
+              # ── explicit 直启 (参数 1:1 对齐用户官方镜像验证命令) ──
+              - name: PD_LAUNCH_MODE
+                value: "explicit"
+              - name: PD_PP_SIZE
+                value: "1"
+              - name: PD_CONTEXT_LENGTH
+                value: "400000"
+              - name: PD_CHUNKED_PREFILL_SIZE
+                value: "16384"
+              - name: PD_MAX_RUNNING_REQUESTS
+                value: "48"          # 终版标定 (P4): ×4 引擎=192 总量, 覆盖 160 并发零失败 (TTFT 2.0s/峰值 3354)
+                                     # 必须 < graph-bs (64) 以触发 bs 重建 (adjusted==requested 时 _recompute 提前返回)
+              - name: PD_CUDA_GRAPH_MAX_BS
+                value: "64"          # >max-running(48) → adjusted=48 触发重建 (dp1 形态唯一可行模式)
+              - name: PD_PAGE_SIZE
+                value: "64"
+              - name: PD_KV_CACHE_DTYPE
+                value: "bfloat16"
+              - name: PD_SCHEDULE_CONSERVATIVENESS
+                value: "0.6"
+              - name: PD_DISAGG_IB_DEVICE
+                value: "mlx5_0"
+              - name: PD_DSPARK_BLOCK_SIZE
+                value: "6"
+              - name: PD_ENABLE_DSPARK
+                value: "1"           # 0=DSPARK off (A/B 对照)
+              # 拓扑 (0.5.14 直启参数; dp 由 launcher 显式传 4)
+              - name: PD_TP_SIZE
+                value: "8"
+              - name: PD_DP_SIZE
+                value: "1"           # per-node 形态: 每引擎自包含 tp8/dp1; 4 引擎在 router 层做 DP
+              - name: PD_MEM_FRACTION_STATIC
+                value: "0.75"        # rc3 标定 decode 值
+
+              # ── 用户给定 env (0.5.14 验证配置) ──
+              - name: PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM
+                value: "1"
+              - name: MACA_SMALL_PAGESIZE_ENABLE
+                value: "1"
+              - name: CUDA_GRAPH_DP_USE_SUM_BS
+                value: "False"
+              - name: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN
+                value: "1"
+              - name: SGLANG_DSPARK_KERNEL_COMMIT_KV_PROJ
+                value: "torch"
+
+              # ── 解释器 / 路径 ──
+              - name: PATH
+                value: "/opt/conda/bin:/opt/maca/bin:/opt/maca/mxgpu_llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+              - name: PD_PYTHON_BIN
+                value: "/opt/conda/bin/python3"
+              - name: POD_IP
+                valueFrom:
+                  fieldRef: { fieldPath: status.podIP }
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef: { fieldPath: metadata.name }
+
+              # ── 沐曦平台环境 ──
+              - name: CUDA_PATH
+                value: "/opt/maca/tools/cu-bridge"
+              - name: MACA_PATH
+                value: "/opt/maca"
+              - name: CUDA_QUEUE_SCHEDULE_POLICY
+                value: "1"
+              - name: MACA_QUEUE_SCHEDULE_POLICY
+                value: "1"
+              - name: CUDA_SMALL_PAGESIZE_ENABLE
+                value: "1"
+              - name: MACA_DIRECT_DISPATCH
+                value: "1"
+              - name: MACA_GRAPH_LAUNCH_QUEUE_POLICY
+                value: "3"
+              - name: MXSHMEM_HCA_LIST
+                value: "mlx5_1"
+              - name: NVSHMEM_DISABLE_CUDA_VMM
+                value: "1"
+              - name: MXSHMEM_DISABLE_MACA_VMM
+                value: "1"
+              - name: NVSHMEM_SYMMETRIC_SIZE
+                value: "3g"
+              - name: MXSHMEM_SYMMETRIC_SIZE
+                value: "3g"
+              - name: NVSHMEM_HCA_LIST
+                value: "mlx5_1"
+              - name: TRITON_ENABLE_ELEMENTWISE_PK_FMA_OPT
+                value: "True"
+              - name: TRITON_DISABLE_CUDA_OPT_MMA_PREFETCH
+                value: "1"
+              - name: TRITON_DISABLE_MACA_OPT_MMA_PREFETCH
+                value: "1"
+              - name: TRITON_ENABLE_CUDA_CHAIN_DOT_OPT
+                value: "1"
+              - name: TRITON_ENABLE_MACA_CHAIN_DOT_OPT
+                value: "1"
+              - name: TRITON_ENABLE_CUDA_COMPILER_INT8_OPT
+                value: "1"
+              - name: TRITON_ENABLE_MACA_COMPILER_INT8_OPT
+                value: "1"
+              - name: TRITON_ENABLE_CUDA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP
+                value: "1"
+              - name: TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP
+                value: "1"
+              - name: TORCH_CUDA_ARCH_LIST
+                value: "8.0 8.6+PTX"
+              - name: TORCH_MACA_ARCH_LIST
+                value: "8.0 8.6+PTX"
+              - name: NCCL_IB_HCA
+                value: "=mlx5_0,mlx5_1"
+              - name: MCCL_IB_HCA
+                value: "=mlx5_0,mlx5_1"
+              - name: SGLANG_DISAGGREGATION_QUEUE_SIZE
+                value: "8"
+              - name: SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
+                value: "24"
+              - name: SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+                value: "1"
+              - name: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
+                value: "false"
+              - name: PYTHONFAULTHANDLER
+                value: "1"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: RES_OPTIONS
+                value: "timeout:1 attempts:1"
+              # ── Mooncake PD KV 传输 (对齐 GLM rc4 镜像 config.sh 默认) ──
+              # 缺此 env 时 transfer engine 走 device-IPC 路径,
+              # mcIpcOpenMemHandle mcErrorInvalidDevicePointer → PD 传输全失败
+              - name: MC_MACA_HOST_TRANSPORT
+                value: "1"
+            securityContext:
+              privileged: true
+              runAsGroup: 44
+            ports:
+              - name: modelserver
+                containerPort: 8200
+                protocol: TCP
+              - name: nixl
+                containerPort: 5600
+                protocol: TCP
+              - name: dist-init
+                containerPort: 5000
+                protocol: TCP
+            resources:
+              limits:   { memory: "1000Gi", cpu: "160", "metax-tech.com/gpu": "8" }
+              requests: { memory: "32Gi", cpu: "8", "metax-tech.com/gpu": "8" }
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: model-data
+                mountPath: /workspace/data
+              - name: mxdriver
+                mountPath: /opt/mxdriver
+                readOnly: true
+              - name: mxcd
+                mountPath: /dev/mxcd
+              - name: sglang-log
+                mountPath: /var/log/sglang-dsv4-0731
+              - name: pd-launcher
+                mountPath: /workspace/llm-d
+                readOnly: true
+            startupProbe:
+              httpGet:
+                path: /health
+                port: modelserver
+              initialDelaySeconds: 120
+              periodSeconds: 30
+              timeoutSeconds: 10
+              failureThreshold: 236
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: modelserver
+              periodSeconds: 15
+              timeoutSeconds: 10
+              failureThreshold: 40
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: modelserver
+              periodSeconds: 10
+              timeoutSeconds: 10
+              failureThreshold: 6
+
+        volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 100Gi }
+          - name: model-data
+            hostPath: { path: /data, type: DirectoryOrCreate }
+          - name: mxdriver
+            hostPath: { path: /opt/mxdriver, type: DirectoryOrCreate }
+          - name: mxcd
+            hostPath: { path: /dev/mxcd, type: CharDevice }
+          - name: sglang-log
+            hostPath: { path: /var/log/sglang-dsv4-0731, type: DirectoryOrCreate }
+          - name: pd-launcher
+            configMap:
+              name: pd-launcher-dsv4-0731
+              defaultMode: 0555

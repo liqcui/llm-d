@@ -87,6 +87,7 @@ spec:
                 --host 0.0.0.0 --port "${PD_ROUTER_HTTP_PORT}" \
                 --prometheus-host 0.0.0.0 --prometheus-port "${PD_ROUTER_METRICS_PORT}" \
                 --request-timeout-secs 18000 --health-check-timeout-secs 90
+                # F1 (10-14) 结论: 默认双 cache_aware 胜出 (3/3 格优于 Po2), 不设策略 flags
           env:
             # 逗号分隔的 "<ip>:<port>" 列表, 指向 worker-index=0 (master) 的宿主机 IP。
             # 当前占位: 部署后替换为实际 master IP (kubectl get pods -o wide | grep dsv4-0731)
