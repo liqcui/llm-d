@@ -1,0 +1,326 @@
+# GLM PD Smart Adapter — 以 ConfigMap 形式挂载, 不放入镜像
+#
+# 定位: 不改动镜像内 config.sh / prefill.sh / decode.sh / models/glm-5.sh 源脚本,
+#       在本适配层完成: ① LWS 拓扑解析; ② PD 可调参数 env → 运行时 sed 回写;
+#       ③ 启动摘要打印; ④ exec 目标角色脚本。以后换模型/换镜像, 只需改镜像名 + 可选 PD_* env。
+#
+# 参照: GPUStack 版本配置 maca-sglang-glm-pd-custom 的 start_pd.sh
+#       (rc4 镜像变量名对齐: model_path_specific / decode_max_running_requests_specific /
+#        decode_mtp_specific / prefill_pp_size_default / prefill_max_running_requests_pre_batch)
+#
+# === 适配层环境变量 ===
+# PD_ROLE                              (必填) prefill | decode
+# PD_MODEL_SPEC                        (可选) 模型脚本名, 默认 glm-5 (→ models/glm-5.sh)
+# LLM_LAUNCH_DIR                       (可选) 启动脚本目录, 默认 /workspace/llm-launch/sglang
+# PD_DRY_RUN                           (可选) 非空时只打印摘要不执行
+#
+# === llm-d 兼容修复 (§3.5, 幂等自动应用, 无需 env) ===
+# prefill/decode 端口 8000/8200 · PD bootstrap 8998 (仅当 config.sh 显式设置时)
+# · --host 0.0.0.0 · --enable-metrics — 镜像未内置时自动补上,
+# 已内置时模式不匹配自动跳过 (新旧镜像通用, 无需按版本维护多套脚本)
+#
+# === 可调参数 env (未设置则保持脚本内默认值) ===
+# SGLANG_CONTEXT_LENGTH                    → context_length_specific (默认 200000)
+# SGLANG_MODEL_PATH                        → model_path_specific (默认 /workspace/data/GLM-5.1-W8A8)
+# SGLANG_PREFILL_MAX_RUNNING_REQUESTS_PRE_BATCH → prefill_max_running_requests_pre_batch
+#                                            (GLM 故障二规避值 32)
+# PD_CHUNKED_PREFILL_SIZE                  → chunked_prefill_size_default (prefill 分块大小)
+# PD_PREFILL_PP_SIZE                       → prefill_pp_size_default
+#                                            (TP 由 nnodes×8/pp 自动计算, 4 节点 pp=4 → TP=8)
+# PD_MEM_FRACTION_STATIC                   → prefill/decode_mem_fraction_static (KV 池显存占比)
+# PD_DECODE_MAX_RUNNING_REQUESTS           → decode_max_running_requests_specific
+# PD_DECODE_MTP                            → decode_mtp_specific (=1 关闭 MTP 推测解码)
+# PD_DECODE_DP_SIZE / PD_DECODE_EP_SIZE    → decode_dp_size / decode_ep_size
+# PD_DECODE_DISABLE_CUDA_GRAPH             → enable_cuda_graph_specific=false (decode 走 eager)
+# SGLANG_QUANTIZATION                      → quantization_specific
+# SGLANG_DISAGGREGATION_QUEUE_SIZE         → PD 传输队列深度 (默认 8)
+# SGLANG_DISAGGREGATION_THREAD_POOL_SIZE   → PD 线程池 (默认 24)
+# SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT  → PD bootstrap 等待超时 (默认 6000)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pd-smart-adapter-glm5
+  labels:
+    llm-d.ai/guide: pd-disaggregation
+data:
+  pd-adapter.sh: |
+    #!/bin/bash
+    # pd-adapter.sh — GLM PD 智能适配层 (LWS 版, ConfigMap 挂载)
+
+    set -euo pipefail
+
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    LAUNCH_DIR="${LLM_LAUNCH_DIR:-/workspace/llm-launch/sglang}"
+
+    # ==========================================
+    # 0. 适配层默认环境变量（IB 设备，GPUStack env 可覆盖）
+    # ==========================================
+    # 容器/网卡实际可见 IB 口为 mlx5_0..mlx5_4。镜像 config.sh 用
+    #   ${LLM_HCA_LIST:-mlx5_bond_2,...} / ${LLM_MOONCAKE_IB_DEVICE:-mlx5_bond_1}
+    # 读取并**无条件**回写 NCCL_IB_HCA/MCCL_IB_HCA/NVSHMEM_HCA_LIST/MXSHMEM_HCA_LIST 及
+    # --disaggregation-ib-device —— readonly 只锁赋值后的变量、不锁 env 读取优先级，
+    # 故在此 export 默认值即可覆盖（2026-10-06 实测: pod 层直接 export NCCL_IB_HCA
+    # 会被 config.sh 覆盖成 mlx5_bond_* → ValueError: Invalid IB devices）。
+    export LLM_MOONCAKE_IB_DEVICE="${LLM_MOONCAKE_IB_DEVICE:-mlx5_0}"
+    export LLM_HCA_LIST="${LLM_HCA_LIST:-mlx5_0,mlx5_1,mlx5_2}"
+
+    # ==========================================
+    # 0.5 参照 GPUStack start_pd.sh 对齐 (env 可覆盖, ${VAR:-默认} 形式)
+    # ==========================================
+    # ① fork 默认 EnvBool(True) → disagg idle 时池核算微差即 raise 杀死 scheduler;
+    #    上游默认 False (仅告警), 恢复之
+    export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE="${SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE:-false}"
+    # ② PD bootstrap 等待超时
+    export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT="${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-6000}"
+    # ③ DNS 快速失败: 避免解析卡住启动与 PD 握手
+    export RES_OPTIONS="${RES_OPTIONS:-timeout:1 attempts:1}"
+    # ④ 显式导出 context_length_specific (rc4 config.sh 以 ${VAR:-默认} 读取, 双保险:
+    #    sed 回写见 §3, 若 config.sh 是 readonly 赋值则靠这里生效)
+    #    ⚠ 用 if 不用 `[ -n ... ] && export ...`: 后者在 env 未设置时整体返回 1,
+    #    在 set -e 下会直接杀掉适配层
+    if [ -n "${SGLANG_CONTEXT_LENGTH:-}" ]; then
+        export context_length_specific="$SGLANG_CONTEXT_LENGTH"
+    fi
+
+    # ==========================================
+    # 1. 校验 PD_ROLE 与目标脚本
+    # ==========================================
+    if [ -z "${PD_ROLE:-}" ]; then
+        echo "[ERROR] Environment variable PD_ROLE is not set (prefill | decode)." >&2
+        exit 1
+    fi
+
+    TARGET_SCRIPT="${LAUNCH_DIR}/${PD_ROLE}.sh"
+    if [ ! -f "$TARGET_SCRIPT" ]; then
+        echo "[ERROR] Target script not found: $TARGET_SCRIPT" >&2
+        exit 1
+    fi
+
+    MODEL_SPEC="${PD_MODEL_SPEC:-glm-5}"
+    CONFIG_FILE="${LAUNCH_DIR}/config.sh"
+    MODEL_CONFIG_FILE="${LAUNCH_DIR}/models/${MODEL_SPEC}.sh"
+
+    # ==========================================
+    # 2. 拓扑变量 (LWS 注入, 与 llm-d 部署约定一致)
+    # ==========================================
+    LEADER_HOST="${LWS_LEADER_ADDRESS%:*}"
+    MASTER_NODE_IP="$(getent hosts "$LEADER_HOST" 2>/dev/null | awk '{print $1}' | head -1 || true)"
+    [ -z "$MASTER_NODE_IP" ] && MASTER_NODE_IP="${POD_IP:-127.0.0.1}"
+    NNODES="${LWS_GROUP_SIZE:-1}"
+    NODE_RANK="${LWS_WORKER_INDEX:-0}"
+
+    # ==========================================
+    # 3. 可调参数 env → 运行时 sed 回写
+    #    (只改容器可写层副本, 镜像内源脚本保持原样)
+    # ⚠️ 两个 override 函数**必须永远返回 0**: 脚本整体 set -euo pipefail,
+    #    未命中模式只是"镜像已内置/变量名不同", 绝不能因此杀掉适配层
+    #    (2026-10-06 实测: 显式 return 1 致首个 WARN 即整体退出 → CrashLoop)
+    # ==========================================
+    _override_line() {
+        local pattern="$1" replacement="$2" file="$3"
+        if grep -qE -e "$pattern" "$file"; then
+            sed -i -E "s|$pattern|$replacement|" "$file"
+            echo "[INFO] Override applied : $replacement"
+        else
+            echo "[WARN] Override skipped: pattern not found in $(basename "$file"): $pattern"
+        fi
+    }
+
+    # 多候选模式覆盖 (rc4 / glmpd / dsv4 血统变量名差异, 命中第一个即停)
+    _override_first() {
+        local replacement="$1" file="$2"
+        shift 2
+        local pattern
+        for pattern in "$@"; do
+            if grep -qE -e "$pattern" "$file"; then
+                sed -i -E "s|$pattern|$replacement|" "$file"
+                echo "[INFO] Override applied : $replacement"
+                return 0
+            fi
+        done
+        echo "[WARN] Override skipped: no pattern matched in $(basename "$file")"
+    }
+
+    # --- config.sh 内联参数 ---
+    if [ -n "${SGLANG_CONTEXT_LENGTH:-}" ]; then
+        _override_first "readonly context_length_specific=\"${SGLANG_CONTEXT_LENGTH}\"" "$CONFIG_FILE" \
+            'readonly context_length_specific=.*' 'context_length_specific="[0-9]+"'
+    fi
+    if [ -n "${SGLANG_PREFILL_MAX_RUNNING_REQUESTS_PRE_BATCH:-}" ]; then
+        _override_line 'readonly prefill_max_running_requests_pre_batch="?[0-9]+"?' \
+            "readonly prefill_max_running_requests_pre_batch=\"${SGLANG_PREFILL_MAX_RUNNING_REQUESTS_PRE_BATCH}\"" "$CONFIG_FILE"
+    fi
+    if [ -n "${PD_CHUNKED_PREFILL_SIZE:-}" ]; then
+        _override_line 'readonly chunked_prefill_size_default="?[0-9]+"?' \
+            "readonly chunked_prefill_size_default=\"${PD_CHUNKED_PREFILL_SIZE}\"" "$CONFIG_FILE"
+    fi
+    if [ -n "${PD_MEM_FRACTION_STATIC:-}" ]; then
+        case "$PD_ROLE" in
+            prefill) _override_first "readonly prefill_mem_fraction_static=\"${PD_MEM_FRACTION_STATIC}\"" "$CONFIG_FILE" \
+                        'readonly prefill_mem_fraction_static="?[0-9.]+"?' 'mem_fraction_static_specific="?[0-9.]+"?' ;;
+            decode)  _override_first "readonly decode_mem_fraction_static=\"${PD_MEM_FRACTION_STATIC}\"" "$CONFIG_FILE" \
+                        'readonly decode_mem_fraction_static="?[0-9.]+"?' 'mem_fraction_static_specific="?[0-9.]+"?' ;;
+        esac
+    fi
+    if [ -n "${SGLANG_DISAGGREGATION_QUEUE_SIZE:-}" ]; then
+        _override_line 'export SGLANG_DISAGGREGATION_QUEUE_SIZE=[0-9]+' \
+            "export SGLANG_DISAGGREGATION_QUEUE_SIZE=${SGLANG_DISAGGREGATION_QUEUE_SIZE}" "$CONFIG_FILE"
+    fi
+    if [ -n "${SGLANG_DISAGGREGATION_THREAD_POOL_SIZE:-}" ]; then
+        _override_line 'export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=[0-9]+' \
+            "export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=${SGLANG_DISAGGREGATION_THREAD_POOL_SIZE}" "$CONFIG_FILE"
+    fi
+    if [ -n "${PD_DECODE_DP_SIZE:-}" ]; then
+        _override_first "readonly decode_dp_size=\"${PD_DECODE_DP_SIZE}\"" "$CONFIG_FILE" \
+            'readonly decode_dp_size="?[0-9]+"?' 'readonly decode_dp_size_default="?[0-9]+"?' 'decode_dp_size_specific="?[0-9]+"?'
+    fi
+    if [ -n "${PD_DECODE_EP_SIZE:-}" ]; then
+        _override_first "readonly decode_ep_size=\"${PD_DECODE_EP_SIZE}\"" "$CONFIG_FILE" \
+            'readonly decode_ep_size="?[0-9]+"?' 'readonly decode_ep_size_default="?[0-9]+"?' 'decode_ep_size_specific="?[0-9]+"?'
+    fi
+
+    # --- 模型脚本参数 (models/glm-5.sh, 仅当模型脚本存在) ---
+    if [ -f "$MODEL_CONFIG_FILE" ]; then
+        if [ -n "${SGLANG_MODEL_PATH:-}" ]; then
+            _override_line '^readonly model_path_specific=.*' \
+                "readonly model_path_specific=\"${SGLANG_MODEL_PATH}\"" "$MODEL_CONFIG_FILE"
+        fi
+        if [ -n "${PD_PREFILL_PP_SIZE:-}" ]; then
+            _override_line '^readonly prefill_pp_size_default=.*' \
+                "readonly prefill_pp_size_default=\"${PD_PREFILL_PP_SIZE}\"" "$MODEL_CONFIG_FILE"
+        fi
+        if [ -n "${PD_DECODE_MAX_RUNNING_REQUESTS:-}" ]; then
+            _override_first "readonly decode_max_running_requests_specific=\"${PD_DECODE_MAX_RUNNING_REQUESTS}\"" "$MODEL_CONFIG_FILE" \
+                '^readonly decode_max_running_requests_specific=.*' '^readonly decode_max_running_requests_default=.*'
+        fi
+        if [ -n "${PD_DECODE_MTP:-}" ]; then
+            _override_first "readonly decode_mtp_specific=\"${PD_DECODE_MTP}\"" "$MODEL_CONFIG_FILE" \
+                '^readonly decode_mtp_specific=.*' '^readonly decode_mtp_default=.*'
+        fi
+        if [ -n "${PD_DECODE_DISABLE_CUDA_GRAPH:-}" ]; then
+            # CUDA graph capture 与部分运行时回退路径不兼容, 必要时 decode 改走 eager
+            _override_first "readonly enable_cuda_graph_specific=\"false\"" "$MODEL_CONFIG_FILE" \
+                '^readonly enable_cuda_graph_specific=.*'
+        fi
+        if [ -n "${SGLANG_QUANTIZATION:-}" ]; then
+            _override_line '^readonly quantization_specific=.*' \
+                "readonly quantization_specific=\"${SGLANG_QUANTIZATION}\"" "$MODEL_CONFIG_FILE"
+        fi
+    else
+        echo "[WARN] Model config not found: $MODEL_CONFIG_FILE (model-script tunables skipped)"
+    fi
+
+    # ==========================================
+    # 3.5 llm-d 兼容修复 (幂等; 镜像未内置时自动补上, 已内置则跳过)
+    #     prefill/decode 端口 8000/8200 · PD bootstrap 8998 · --host 0.0.0.0
+    #     · --enable-metrics
+    # ==========================================
+    _override_line 'prefill_server_port="?[0-9]+"?' 'prefill_server_port="8000"' "$CONFIG_FILE"
+    _override_line 'decode_server_port="?[0-9]+"?' 'decode_server_port="8200"' "$CONFIG_FILE"
+
+    # PD bootstrap: GLM config.sh 通常不显式设置 (sglang 默认 8998, 与 llm-d sidecar 一致),
+    # 显式设置时才改写, 避免无谓 WARN
+    if grep -qE -- '--disaggregation-bootstrap-port=[0-9]+' "$CONFIG_FILE"; then
+        _override_line '--disaggregation-bootstrap-port=[0-9]+' '--disaggregation-bootstrap-port=8998' "$CONFIG_FILE"
+    else
+        echo "[INFO] Fix n/a : 无显式 bootstrap 端口 (sglang 默认 8998, llm-d sidecar 兼容)"
+    fi
+
+    # --host 强制 0.0.0.0 (hostNetwork 下 /health 探针与跨节点 PD 握手可达)
+    _override_line '--host="?\$local_ip"?' '--host=0.0.0.0' "$CONFIG_FILE"
+
+    # --enable-metrics (GPUStack/压测抓取 /metrics; 已含则跳过)
+    if grep -q -- '--enable-metrics' "$TARGET_SCRIPT"; then
+        echo "[INFO] Fix already applied : --enable-metrics in $(basename "$TARGET_SCRIPT")"
+    elif grep -qE 'python3 -m sglang.launch_server' "$TARGET_SCRIPT"; then
+        sed -i -E 's|python3 -m sglang.launch_server|python3 -m sglang.launch_server --enable-metrics|' "$TARGET_SCRIPT"
+        echo "[INFO] Fix applied : --enable-metrics in $(basename "$TARGET_SCRIPT")"
+    else
+        echo "[WARN] Fix skipped: launch_server 调用模式未匹配 $(basename "$TARGET_SCRIPT") (metrics 未注入)"
+    fi
+
+    # ==========================================
+    # 4. 安全读取有效值 (grep 提取, 绝不 source)
+    # ==========================================
+    _extract_value() {
+        local var_name="$1" file="$2" line
+        line="$(grep -oE "(readonly[[:space:]]+)?${var_name}=\"?[0-9]+\.?[0-9]*\"?" "$file" 2>/dev/null | tail -1 || true)"
+        line="${line#*${var_name}=}"
+        line="${line#\"}"
+        line="${line%\"}"
+        echo "$line"
+    }
+
+    VAL_context_length=$(_extract_value "context_length_specific" "$CONFIG_FILE")
+    VAL_prefill_max_rq=$(_extract_value "prefill_max_running_requests_pre_batch" "$CONFIG_FILE")
+    VAL_chunked_prefill=$(_extract_value "chunked_prefill_size_default" "$CONFIG_FILE")
+    VAL_queue_size=$(_extract_value "SGLANG_DISAGGREGATION_QUEUE_SIZE" "$CONFIG_FILE")
+    VAL_thread_pool=$(_extract_value "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE" "$CONFIG_FILE")
+
+    VAL_model_path=""
+    VAL_decode_max_rq=""
+    VAL_decode_mtp=""
+    VAL_prefill_pp=""
+    VAL_dp=""
+    VAL_ep=""
+    if [ -f "$MODEL_CONFIG_FILE" ]; then
+        VAL_model_path=$(grep -oE '^readonly model_path_specific="?[^"]+"?' "$MODEL_CONFIG_FILE" 2>/dev/null | head -1 | sed -E 's/^readonly model_path_specific="?//; s/"$//' || true)
+        VAL_decode_max_rq=$(_extract_value "decode_max_running_requests_specific" "$MODEL_CONFIG_FILE")
+        VAL_decode_mtp=$(_extract_value "decode_mtp_specific" "$MODEL_CONFIG_FILE")
+        VAL_prefill_pp=$(_extract_value "prefill_pp_size_default" "$MODEL_CONFIG_FILE")
+        VAL_dp=$(_extract_value "decode_dp_size" "$CONFIG_FILE")
+        VAL_ep=$(_extract_value "decode_ep_size" "$CONFIG_FILE")
+    fi
+
+    case "$PD_ROLE" in
+        prefill) ENTRY_PORT=$(_extract_value "prefill_server_port" "$CONFIG_FILE") ;;
+        decode)  ENTRY_PORT=$(_extract_value "decode_server_port" "$CONFIG_FILE") ;;
+        *)       ENTRY_PORT="unknown" ;;
+    esac
+    [ -z "$ENTRY_PORT" ] && ENTRY_PORT="unknown"
+
+    # ==========================================
+    # 5. 启动摘要
+    # ==========================================
+    echo "[INFO] ============================================================"
+    echo "[INFO] GLM PD Smart Adapter - Startup Summary"
+    echo "[INFO] ============================================================"
+    echo "[INFO] --- Adapter Control Variables ---"
+    echo "[INFO] PD_ROLE                                : ${PD_ROLE}"
+    echo "[INFO] MODEL_SPEC                             : ${MODEL_SPEC}"
+    echo "[INFO] DRY_RUN                                : ${PD_DRY_RUN:-<not set>}"
+    echo "[INFO] Launch Dir                             : ${LAUNCH_DIR}"
+    echo "[INFO] --- Topology ---"
+    echo "[INFO] Master IP                              : ${MASTER_NODE_IP}"
+    echo "[INFO] NNodes                                 : ${NNODES}"
+    echo "[INFO] Node Rank                              : ${NODE_RANK}"
+    echo "[INFO] --- Tunable Parameters (set via PD_* env vars) ---"
+    echo "[INFO] context_length_specific                : ${VAL_context_length:-N/A}"
+    echo "[INFO] chunked_prefill_size_default           : ${VAL_chunked_prefill:-N/A}"
+    echo "[INFO] prefill_max_running_requests_pre_batch : ${VAL_prefill_max_rq:-N/A}"
+    echo "[INFO] prefill_pp_size_default                : ${VAL_prefill_pp:-N/A}  (TP = nnodes×8/pp 自动计算)"
+    echo "[INFO] decode_max_running_requests_specific   : ${VAL_decode_max_rq:-N/A}"
+    echo "[INFO] decode_mtp_specific                    : ${VAL_decode_mtp:-N/A}  (=1 关闭 MTP 推测解码)"
+    echo "[INFO] decode_dp_size / decode_ep_size        : ${VAL_dp:-N/A} / ${VAL_ep:-N/A}"
+    echo "[INFO] mem_fraction_static                    : ${PD_MEM_FRACTION_STATIC:-<default>}"
+    echo "[INFO] model_path_specific                    : ${VAL_model_path:-N/A}"
+    echo "[INFO] quantization_specific                  : ${SGLANG_QUANTIZATION:-auto}"
+    echo "[INFO] PD_DECODE_DISABLE_CUDA_GRAPH           : ${PD_DECODE_DISABLE_CUDA_GRAPH:-<not set>}"
+    echo "[INFO] SGLANG_DISAGGREGATION_QUEUE_SIZE       : ${VAL_queue_size:-N/A}"
+    echo "[INFO] SGLANG_DISAGGREGATION_THREAD_POOL_SIZE : ${VAL_thread_pool:-N/A}"
+    echo "[INFO] SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT: ${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT}"
+    echo "[INFO] --- Execution ---"
+    echo "[INFO] ${PD_ROLE} Entry Addr                  : http://${MASTER_NODE_IP}:${ENTRY_PORT}"
+    echo "[INFO] Target Script                          : ${TARGET_SCRIPT}"
+    echo "[INFO] Final Call                             : ${PD_ROLE}.sh ${MODEL_SPEC} ${MASTER_NODE_IP} ${NNODES} ${NODE_RANK}"
+    echo "[INFO] ============================================================"
+
+    # ==========================================
+    # 6. 执行目标脚本
+    # ==========================================
+    if [ -n "${PD_DRY_RUN:-}" ]; then
+        echo "[INFO] PD_DRY_RUN set, exiting without launching."
+        exit 0
+    fi
+
+    exec bash "$TARGET_SCRIPT" "$MODEL_SPEC" "$MASTER_NODE_IP" "$NNODES" "$NODE_RANK"

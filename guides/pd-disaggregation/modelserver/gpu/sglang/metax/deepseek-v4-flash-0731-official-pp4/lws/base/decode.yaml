@@ -135,6 +135,8 @@ spec:
                 value: "16"          # ⚠ 厂商语义=每 DP rank; ×dp4 = 64 总并发 (与 PP1 explicit cap64 对齐)
               - name: PD_EP_SIZE
                 value: "1"           # DSPARK: ep>1 时 draft verify graph 捕获必崩
+              - name: PD_CUDA_GRAPH_MAX_BS
+                value: "128"         # Phase1 E1 (10-14): 预捕获大图 (原未设=厂商默认 8); 值≠每rank cap(16) 规避 DSPARK bs=None 缺陷
               - name: PD_PAGE_SIZE
                 value: "64"
               - name: PD_KV_CACHE_DTYPE
@@ -151,7 +153,7 @@ spec:
               - name: PD_DP_SIZE
                 value: "4"
               - name: PD_MEM_FRACTION_STATIC
-                value: "0.75"        # rc3 标定 decode 值
+                value: "0.78"        # Phase1 R2 (10-14): 0.75→0.78 增 KV 池容 (解 c128/c160 A 类池饱和断言: available=0/evictable=0)
 
               # ── 用户给定 env (0.5.14 验证配置) ──
               - name: PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM
@@ -234,8 +236,8 @@ spec:
                 value: "8"
               - name: SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
                 value: "24"
-              - name: SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
-                value: "1"
+              - name: SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK
+                value: "0"           # Phase1 (10-14): 废弃名 SGL_DISABLE_* → 正确名 (environ.py 实际读此变量; =0 关检查)
               - name: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
                 value: "false"
               - name: PYTHONFAULTHANDLER

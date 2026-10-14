@@ -34,12 +34,14 @@ form_dir() { case "$1" in
   pernode) echo "$METAX/deepseek-v4-flash-0731-pernode";;
   f4)      echo "$METAX/deepseek-v4-flash-0731-full4p4d";;
   pp4)     echo "$METAX/deepseek-v4-flash-0731-official-pp4";;
-  *) die "未知形态: $1 (pernode|f4|pp4)";;
+  pp1)     echo "$METAX/deepseek-v4-flash-0731-pp1";;
+  *) die "未知形态: $1 (pernode|f4|pp4|pp1)";;
 esac; }
 form_env() { case "$1" in
   pernode) echo "dsv4-0731-pernode";;
   f4)      echo "dsv4-0731-f4";;
   pp4)     echo "dsv4-0731-pp4full";;
+  pp1)     echo "dsv4-0731-pp1";;
 esac; }
 
 sync_router() {   # leader 漂移自愈: 从实况 pods 取角色 leader IP

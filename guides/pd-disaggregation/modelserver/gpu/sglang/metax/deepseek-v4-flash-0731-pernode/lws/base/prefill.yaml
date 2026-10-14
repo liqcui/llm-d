@@ -115,7 +115,7 @@ spec:
               #   1=开 --enable-hierarchical-cache + 伴生 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1
               #   (DSv4 混合 attention 需 UnifiedRadixCache); 参数=0.5.13 L2-PP1 标定组合
               - name: PD_ENABLE_HICACHE
-                value: "0"
+                value: "0"           # 默认关（L2 实验用 env 切换; 终版 L2 数据=label final-2026-10-14-pernode-l2）
               - name: PD_HICACHE_RATIO
                 value: "0.5"
               - name: PD_HICACHE_MEM_LAYOUT

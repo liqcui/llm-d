@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 沐曦 (MetaX) SGLang PD 分离 — GLM-5.1 — 4 Prefill + 4 Decode (llm-d 规范, LWS)
+#
+# ⚠️ 独立部署: 与旧 GLM 方案 (metax/lws/, glmpd 镜像) 及 DeepSeek 方案
+#    (deepseek-v4-flash/lws/) 互斥 — hostNetwork 端口 (8000/8200/5600/5000) 冲突,
+#    同一节点上不可并存; 节点标签按角色互斥分配。
+#
+# 目录结构:
+#   base/                  — LWS (prefill-glm5 + decode-glm5) + headless Services + SA
+#                            + pd-smart-adapter-glm5 (GLM PD 适配层 ConfigMap)
+#   kustomization.yaml     — 部署入口
+#
+# 部署前:
+#   1. LWS CRD 已装 (参考 README.metax-lws.md §2.1)
+#   2. 模型: 所有候选节点宿主机 /data/GLM-5.1-W8A8 必须存在 (hostPath → /workspace/data)
+#   3. 节点标签 (hostNetwork 端口冲突, 各角色节点互斥):
+#        prefill ×4: kubectl label node <node> metax-sglang-pd-prefill-glm5=true --overwrite
+#        decode  ×4: kubectl label node <node> metax-sglang-pd-decode-glm5=true --overwrite
+#        router  ×1: kubectl label node <node> metax-sglang-pd-router-glm5=true --overwrite
+#   4. RDMA: 节点 mlx5_0/mlx5_1 应为 IB ACTIVE (ibdev2netdev 检查)
+#   5. InferencePool pd-disaggregation (Helm 管理) selector 匹配
+#      llm-d.ai/guide=pd-disaggregation + worker-index=0, targetPort 8000
+#
+# 拓扑 (llm-d EPP 接入, 1+1 逻辑实例):
+#   Prefill LWS: replicas=1 size=4 → 4 pods / 4 节点 / 32 卡 (TP=8 PP=4 DP=1, HTTP :8000, bootstrap :8998)
+#   Decode LWS:  replicas=1 size=4 → 4 pods / 4 节点 / 32 卡 (TP=32 DP=32 EP=32, modelserver :8200)
+#                每 decode pod 带 routing-proxy sidecar (:8000, kv-connector=sglang, EPP 入口)
+#   访问链路:   Client → EPP (pd-disaggregation-epp:80) → routing-proxy:8000 → prefill:8000 / decode:8200
+#   并行入口:   glm5-router (sglang_router Deployment, :8001, 压测对比用)
+
+namespace: metax-ai-pd
+
+resources:
+  - base

@@ -151,7 +151,7 @@ spec:
               - name: PD_DP_SIZE
                 value: "4"
               - name: PD_MEM_FRACTION_STATIC
-                value: "0.75"        # rc3 标定 decode 值
+                value: "0.78"        # Phase5 修复 (10-14): 0.75→0.78 治 c160 A 类池压力风暴（同 pp4full R2 药方）
 
               # ── 用户给定 env (0.5.14 验证配置) ──
               - name: PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM

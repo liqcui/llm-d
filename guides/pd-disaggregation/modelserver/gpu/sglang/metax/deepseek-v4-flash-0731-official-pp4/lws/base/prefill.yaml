@@ -136,7 +136,7 @@ spec:
               - name: PD_DP_SIZE
                 value: "1"
               - name: PD_MEM_FRACTION_STATIC
-                value: "0.82"        # rc3 标定 prefill 值 (env 可覆盖)
+                value: "0.78"        # Phase1 D-fix (10-14): 0.82→0.78 解 65K 系统性 OOM (2.57GiB 分配失败@54GB; 释放 ~2.5GB 激活余量)
 
               # ── 用户给定 env (0.5.14 验证配置) ──
               - name: PYTORCH_ENABLE_PG_HIGH_PRIORITY_STREAM
@@ -219,8 +219,8 @@ spec:
                 value: "8"
               - name: SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
                 value: "24"
-              - name: SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
-                value: "1"
+              - name: SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK
+                value: "0"           # Phase1 (10-14): 废弃名 → 正确名 (同 decode 侧)
               # fork 默认 True → disagg prefill idle 时池核算微差即 raise 杀 scheduler
               - name: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
                 value: "false"
