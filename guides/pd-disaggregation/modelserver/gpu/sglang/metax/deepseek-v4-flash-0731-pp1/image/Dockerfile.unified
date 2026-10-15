@@ -1,0 +1,36 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# [统一镜像 unified] 0.5.14-maca dsv4-0731 全补丁单一版本（2026-10-15 用户指令）
+#
+# 目的：所有部署形态统一使用同一镜像，终结双镜像并存局面
+#   -dsv4-0731-retractfix（pernode/3P5D/pp1 explicit 族）
+#   -dsv4-0731-llm-retractfix（official-pp4 厂商脚本族）
+#
+# 层清单（自下而上）:
+#   L0 官方基线   0.5.14-maca.ai3.8.2.122-torch2.10-py312-ubuntu22.04-amd64
+#   L1 ModelSlim  0731 W8A8 修复 — PATCH-0731 ×4 文件（apply_0731_dsv4_patch.py）
+#   L2 llm-launch 官方 llm-launch 脚本 0.5.14+DSPARK 适配 + iproute2
+#                 （/workspace/llm-launch/，PATCH-0731 shell 7 处）
+#   L3 retract    decode retract 崩溃最小修复 — BH-retract-fix×3 + BH-patch3×1
+#                 （apply_retract_fix.py，与两旧镜像同源）
+#   FROM -dsv4-0731-llm（= 已验证的 L0-L2 层）+ L3，构建期全层核验（verify_unified.py）
+#
+# 覆盖形态（通用）:
+#   - explicit 直启（pernode / 3P5D / pp1 族）：L2 脚本层不被加载（无害）；
+#   - 厂商脚本（official-pp4 族）：L2 必需。
+#   当前模型（compressed-tensors 格式）不加载 L1 ModelSlim 代码路径（无害）。
+#
+# 构建:
+#   sudo docker build -f Dockerfile.unified -t harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-unified .
+#   sudo docker push harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-unified
+# ═══════════════════════════════════════════════════════════════════════════
+FROM harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-llm
+
+LABEL dsv4-0731.image="unified" \
+      dsv4-0731.layers="modelslim-0731,llm-launch,retractfix" \
+      dsv4-0731.built="2026-10-15"
+
+COPY apply_retract_fix.py /tmp/apply_retract_fix.py
+COPY verify_unified.py /tmp/verify_unified.py
+RUN /opt/conda/bin/python3 /tmp/apply_retract_fix.py \
+ && /opt/conda/bin/python3 /tmp/verify_unified.py \
+ && rm -f /tmp/apply_retract_fix.py /tmp/verify_unified.py

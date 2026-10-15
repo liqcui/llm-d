@@ -55,7 +55,7 @@ spec:
 
         containers:
           - name: modelserver
-            image: harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-torch2.10-py312-ubuntu22.04-amd64
+            image: harbor.isuanova.com/metax/sglang:0.5.14-maca.ai3.8.2.122-dsv4-0731-unified   # 统一镜像 (10-15)
             imagePullPolicy: Always
             workingDir: /workspace
             command:

@@ -5,7 +5,7 @@ set -euo pipefail
 METAX="$(cd "$(dirname "$0")/.." && pwd)"
 DIR="$METAX/deepseek-v4-flash-0731-pernode-3p5d"
 echo "== 1/3 角色标签：prefill={28,29,31} decode={32,33,34,35,36} =="
-for n in mxgpu-3-36 mxgpu-3-31; do
+for n in mxgpu-3-36; do  # 仅 36（3P5D：31 保持 prefill）
   kubectl label node $n metax-sglang-pd-prefill-dsv4-0731- metax-sglang-pd-decode-dsv4-0731=true --overwrite
 done
 echo "== 2/3 渲染（IP 占位符化） =="
