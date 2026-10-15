@@ -139,6 +139,10 @@ spec:
                 value: "mlx5_0"
               - name: PD_DSPARK_BLOCK_SIZE
                 value: "6"
+              - name: PD_CUDA_GRAPH_MAX_BS
+                value: "64"          # G3 最小缺陷绕过 (10-15): 纯厂商默认在 pernode dp1 触发
+                                     # 缺陷三号 (bs=None: graph8==min(8,mr10)→永不重建) boot 崩;
+                                     # 仅补此一项 (>mr 强制触发重建), 其余参数全保持厂商默认
               - name: PD_ENABLE_DSPARK
                 value: "1"           # 0=DSPARK off (A/B 对照)
               # 拓扑 (0.5.14 直启参数; dp 由 launcher 显式传 4)
